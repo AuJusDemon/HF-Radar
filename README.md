@@ -130,7 +130,7 @@ If you want to run a relay to handle proxy rotation centrally (e.g. multiple bot
 | `detectors.py` | All HF API polling logic — every alert is fired from here |
 | `commands.py` | Telegram command handlers and callback routing |
 | `telegram_bot.py` | TelegramBot shim, keyboard builders, UI text |
-| `alerts.py` | Alert message formatting (+ tone system) |
+| `alerts.py` | Alert message formatting |
 | `hf_client.py` | HF API transport — handles auth, rate limiting, retries |
 | `db.py` | SQLite schema + all DB operations |
 
