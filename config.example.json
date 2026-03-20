@@ -1,0 +1,17 @@
+{
+  "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
+  "test_chat_id": 0,
+  "hf_client_id": "hf_clientid_...",
+  "hf_client_secret": "hf_secret_...",
+
+  "database": {
+    "db_path": "hfradar.db"
+  },
+
+  "_transport_comment": "Choose one: direct proxy OR relay. Leave unused fields blank or omit them.",
+
+  "hf_proxy_url": "socks5://user:pass@your-residential-proxy:port",
+
+  "vps_relay": "",
+  "proxy_secret": ""
+}
