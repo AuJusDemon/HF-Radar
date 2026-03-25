@@ -2,41 +2,58 @@
 Notification detectors.
 
 Reply/mention detection:
-  - posts _uid page 1, perpage 20  → discover thread IDs from your 20 most recent posts
+  - posts _uid page 1, perpage 30  → discover thread IDs from recent posts (gated on postnum change)
   - threads _tid [known_tids]      → poll lastpost/lastposteruid every cycle
   - lastpost changed + poster != us → fetch posts _tid last page for snippet → alert
   - dispute_tid added to known_tids so dispute thread replies are caught automatically
   Deduplication via seen_events table only.
 
 Buddy detection:
-  - posts _uid page 1, perpage 20  → get buddy's 20 most recent posts each cycle
-  - New tid → thread alert (all modes)
-  - New pid → post alert (mode=all only)
+  - ALL buddy UIDs batched into ONE threads call (1 call vs N calls)
+  - mode=all buddies also batched into ONE posts call (1 more call for all of them)
+  - usergroup check folded into the same batch as 3rd endpoint (no separate call)
+  - gate: max(270, 90 × buddy_count) seconds — fires ~13×/hr at 3 buddies
 
-── API call budget (per slow cycle, 1 user) ────────────────────────────────────────────
-  BEFORE all optimizations (baseline):
-    discovery posts + threads _uid:  2 calls  (was running 10 pages on restart)
-    poll ALL 92 known_tids:          4 calls  (92 tids / 30 per chunk)
-    check_account_events (medium):   3 calls
-    buddy check:                     1 call
-    ~10 calls/cycle x 20 cycles/hr = ~200 calls/hr  <- was hitting limit
+── API call budget (per hour, 1 user, 3 buddies, ~97 known threads) ────────────────────
+  BASELINE (original code, no optimizations):
+    check_account_events (medium):   3 calls × 30/hr  =  90 calls/hr
+    per-buddy threads+posts:         3 calls × 20/hr  =  60 calls/hr
+    standalone bratings:             2 calls/hr
+    thread poll (hot):               1 call  × 20/hr  =  20 calls/hr
+    discovery (gated):               ~0.5/hr
+    fid threads:                     6/hr
+    disputes:                        2/hr
+    TOTAL ≈ 180/hr  ← was hitting the 240/hr wall
 
-  AFTER hot/cold split + fixes:
-    discovery posts + threads _uid:  2 calls  (every cycle, 1 page each)
-    poll HOT tids (~20 active):      1 call   (fits in 1 chunk of 30)
-    poll COLD tids (every 30 min):   3 calls  (amortized = 0.3/cycle avg)
-    check_account_events (medium):   3 calls
-    buddy check:                     1 call
-    ~7 calls/cycle, ~3.3 avg amortized = ~66 calls/hr  <- ~67% reduction
+  AFTER all optimizations (this file):
+    check_account_events (medium):   1 call × 20/hr   =  20 calls/hr   [interval 120→180]
+    buddy batch (all UIDs, 1 call):  1 call × 13/hr   =  13 calls/hr   [was 60]
+    bratings folded into medium:     0 dedicated calls [was 2-4/hr]
+    thread poll (hot):               1 call × 20/hr   =  20 calls/hr   (unchanged)
+    discovery (gated):               ~0.5/hr           (unchanged)
+    fid threads:                     ~4/hr             [interval 600→900]
+    disputes:                        2/hr               (unchanged)
+    uid resolution (medium):         ~2/hr              (unchanged)
+    TOTAL ≈ 62/hr  ← ~66% reduction, ~178 remaining at any point
 
   Change log with call impact:
-    [-5/cycle] hot/cold poll split    only poll active threads each cycle
-    [ 0/cycle] discovery every cycle  restored but capped at 1 page (was off)
-    [-5/start] bootstrap fix          5-page sweep runs once ever, not every restart
-    [  varies] rate limit guard       stops loops early if limit is low
+    [-47/hr] buddy batching          all buddy UIDs in one _uid array, UG folded in
+    [-10/hr] medium interval 120→180 20 cycles/hr instead of 30
+    [ -4/hr] bratings folded         piggybacked as 4th endpoint in medium batch
+    [ -2/hr] fid interval 600→900    new threads don't post faster than 15 min
+    [-5/start] bootstrap fix         5-page sweep runs once ever, not every restart
+    [  varies] rate limit guard      stops loops early if limit is low
+
+  NOTE on buddy _perpage batching:
+    When all buddy UIDs share one call, _perpage:30 is the TOTAL across all UIDs.
+    At 3 buddies this is ~10 results/buddy. Thread alerts are forgiving (threads persist,
+    missed ones show up next cycle). Posts on mode=all buddies are higher-risk — a very
+    prolific buddy could crowd others out. Increase _perpage to 30 (already max) and
+    rely on the 270s interval being short enough to not miss anything meaningful.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import re
 import time
@@ -49,12 +66,16 @@ import alerts as tones
 
 _dblog = logging.getLogger("hfradar.db")
 
+# Dedicated thread pool for DB calls — prevents them from competing with
+# other executor work (HF relay parsing, etc.) in the default pool.
+_db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="det_db")
+
 
 async def _db(fn, *args):
     loop = asyncio.get_running_loop()
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(None, fn, *args),
+            loop.run_in_executor(_db_executor, fn, *args),
             timeout=15,
         )
     except Exception as e:
@@ -97,6 +118,11 @@ def find_mention(message: str, uid: str, username: str):
     return False
 
 
+def _mute_button(tid) -> dict:
+    """Inline keyboard with a Mute Thread button — attached to reply/mention alerts."""
+    return {"inline_keyboard": [[{"text": "🔕 Mute thread", "callback_data": f"mute_thread_{tid}"}]]}
+
+
 def rep_delta(history: list, window_seconds: int) -> int | None:
     """Return rep change over the last window_seconds. None if not enough history."""
     if not history or len(history) < 2:
@@ -115,6 +141,121 @@ def rep_delta(history: list, window_seconds: int) -> int | None:
     return current_val - past_entry.get("val", 0)
 
 
+# ── Contract status map (module-level — shared by check_account_events + risk) ──
+# Confirmed via live API polling — these differ from HF's public docs.
+CONTRACT_STATUS = {
+    "1": "awaiting approval",
+    "2": "cancelled",
+    "5": "active",
+    "6": "complete",
+    "8": "incomplete",
+}
+
+
+async def _counterparty_risk(hf: HFClient, their_uid: int) -> str:
+    """
+    Pull a quick risk brief on a contract counterparty.
+    Fires 1 extra API call (3 endpoints) only when a NEW contract is detected.
+    Returns a one-line summary string with risk flag, empty string on failure/rate-limit.
+
+    Format examples:
+      ⚠️ 12 posts · 3 contracts (2 bad) · b-ratings: +1/−2
+         └ "never delivered, total scam"
+      ✅ 4,201 posts · 18 contracts · b-ratings: +15/−0
+    """
+    if is_rate_limited(hf.token):
+        return ""
+
+    data = await hf.read({
+        "users": {
+            "_uid":       [their_uid],
+            "uid":        True,
+            "postnum":    True,
+            "reputation": True,
+        },
+        "bratings": {
+            "_to":      [their_uid],
+            "_perpage": 30,
+            "crid":     True,
+            "amount":   True,
+            "message":  True,
+        },
+        "contracts": {
+            "_uid":     [their_uid],
+            "_perpage": 30,
+            "cid":      True,
+            "status":   True,
+            "inituid":  True,
+            "otheruid": True,
+        },
+    })
+    if not data:
+        return ""
+
+    # ── Users ─────────────────────────────────────────────────────────────────
+    postnum = 0
+    if "users" in data:
+        u = data["users"]
+        if isinstance(u, list): u = u[0] if u else {}
+        postnum = int(u.get("postnum") or 0)
+
+    # ── B-ratings ─────────────────────────────────────────────────────────────
+    pos_ratings  = 0
+    neg_ratings  = 0
+    worst_note   = ""
+    if "bratings" in data:
+        brs = data["bratings"]
+        if isinstance(brs, dict): brs = [brs]
+        for b in (brs or []):
+            amt = int(b.get("amount") or 0)
+            if amt > 0:
+                pos_ratings += 1
+            elif amt < 0:
+                neg_ratings += 1
+                msg = (b.get("message") or "").strip()
+                if msg and not worst_note:
+                    worst_note = msg[:80]
+
+    # ── Contracts ─────────────────────────────────────────────────────────────
+    total_contracts = 0
+    bad_contracts   = 0   # cancelled or incomplete
+    if "contracts" in data:
+        cts = data["contracts"]
+        if isinstance(cts, dict): cts = [cts]
+        for ct in (cts or []):
+            ci = str(ct.get("inituid") or "")
+            co = str(ct.get("otheruid") or "")
+            if str(their_uid) not in (ci, co):
+                continue
+            total_contracts += 1
+            mapped = CONTRACT_STATUS.get(str(ct.get("status") or ""), "")
+            if mapped in ("cancelled", "incomplete"):
+                bad_contracts += 1
+
+    # ── Assemble ──────────────────────────────────────────────────────────────
+    parts = [f"{postnum:,} posts"]
+
+    if total_contracts > 0:
+        ct_str = f"{total_contracts} contract{'s' if total_contracts != 1 else ''}"
+        if bad_contracts > 0:
+            ct_str += f" ({bad_contracts} bad)"
+        parts.append(ct_str)
+    else:
+        parts.append("no contracts")
+
+    if pos_ratings or neg_ratings:
+        parts.append(f"b-ratings: +{pos_ratings}/−{neg_ratings}")
+    else:
+        parts.append("no b-ratings")
+
+    risky  = (postnum < 50) or (neg_ratings > 0) or (bad_contracts > 0)
+    prefix = "⚠️ " if risky else "✅ "
+    result = prefix + " · ".join(parts)
+    if worst_note:
+        result += f'\n   └ "{worst_note}"'
+    return result
+
+
 # ── Account events ─────────────────────────────────────────────────────────────
 
 async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_cfg: dict):
@@ -123,7 +264,6 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
     notifs  = user.get("notifications") or {}
     chat_id = user["chat_id"]
     my_uid  = user["hf_uid"]
-    tone    = user.get("tone") or "normal"
     now     = int(time.time())
 
     # Single batched call: me + contracts (with embedded disputes) + bratings + bytes
@@ -169,8 +309,19 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
                 "odispute":     ["cdid", "contractid", "claimantuid", "defendantuid",
                                  "dateline", "status", "dispute_tid", "claimantnotes"],
             },
-            # NOTE: bratings moved to slow loop (check_bratings). Rare events — polling
-            # every 3 min is fine and frees one slot in this 4-endpoint medium batch.
+            # bratings piggybacked here as 4th endpoint — zero extra API cost since the
+            # call was already happening. Processing is still gated to 30 min (rare events)
+            # but the data comes free every medium cycle. Eliminates standalone check_bratings call.
+            "bratings": {
+                "_to":        [my_uid],
+                "_perpage":   10,
+                "crid":       True,
+                "contractid": True,
+                "fromid":     True,
+                "dateline":   True,
+                "amount":     True,
+                "message":    True,
+            },
             "bytes": {
                 "_to":      [my_uid],
                 "_perpage": 10,   # medium loop is every 2min; 10 is plenty
@@ -286,7 +437,7 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
             current  = int(raw_pms)
             previous = int(user.get("last_unread_pms") or 0)
             if current > previous:
-                await tg.send(chat_id, tones.fmt_pm(tone, current - previous, current))
+                await tg.send(chat_id, tones.fmt_pm(current - previous, current))
             await _db(upsert_user, db_cfg, chat_id, {"last_unread_pms": current})
 
     # ── Popularity ────────────────────────────────────────────────────────────
@@ -309,7 +460,7 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
             if previous_rep != 0 and current_rep != previous_rep:
                 diff      = current_rep - previous_rep
                 delta_7d  = rep_delta(rep_history, 7 * 86400)
-                await tg.send(chat_id, tones.fmt_popularity(tone, diff, current_rep, my_uid, delta_7d=delta_7d))
+                await tg.send(chat_id, tones.fmt_popularity(diff, current_rep, my_uid, delta_7d=delta_7d))
             if current_rep != previous_rep or previous_rep == 0:
                 await _db(upsert_user, db_cfg, chat_id, {"last_reputation": current_rep})
 
@@ -367,7 +518,7 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
                 current_wp = int(raw_wp)
                 prev_wp    = int(user.get("last_warningpoints") or 0)
                 if prev_wp != 0 and current_wp > prev_wp:
-                    await tg.send(chat_id, tones.fmt_warning_points(tone, prev_wp, current_wp))
+                    await tg.send(chat_id, tones.fmt_warning_points(prev_wp, current_wp))
                     log.info(f"Warning points alert: chat_id={chat_id} {prev_wp}→{current_wp}")
                 if current_wp != prev_wp:
                     await _db(upsert_user, db_cfg, chat_id, {"last_warningpoints": current_wp})
@@ -381,10 +532,10 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
             prev_ug = str(user.get("last_usergroup") or "")
             if prev_ug and raw_ug != prev_ug:
                 if raw_ug == "7":
-                    await tg.send(chat_id, tones.fmt_self_exile(tone))
+                    await tg.send(chat_id, tones.fmt_self_exile())
                     log.info(f"Self-exile detected: chat_id={chat_id} ug={raw_ug}")
                 elif raw_ug == "38":
-                    await tg.send(chat_id, tones.fmt_self_ban(tone))
+                    await tg.send(chat_id, tones.fmt_self_ban())
                     log.info(f"Self-ban detected: chat_id={chat_id} ug={raw_ug}")
             if raw_ug != prev_ug:
                 await _db(upsert_user, db_cfg, chat_id, {"last_usergroup": raw_ug})
@@ -406,15 +557,6 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
     linked_at       = int(user.get("linked_at") or 0) or int(time.time())
     contract_states = dict(user.get("contract_states") or {})
     cs_changed      = False
-
-    # HF contract status is returned as an integer. Confirmed via API polling.
-    CONTRACT_STATUS = {
-        "1": "awaiting approval",
-        "2": "cancelled",
-        "5": "active",
-        "6": "complete",
-        "8": "incomplete",
-    }
 
     if "contracts" in data:
         contracts = data["contracts"]
@@ -444,8 +586,16 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
                     await _db(mark_event_seen, db_cfg, chat_id, "contract", cid)
                 else:
                     terms = strip_bbcode(ct.get("terms", ""))[:SNIPPET_LEN]
+                    # Determine counterparty UID — whoever is not us
+                    _init = str(ct.get("inituid") or "")
+                    _other = str(ct.get("otheruid") or "")
+                    _their_uid = int(_other) if _init == str(my_uid) and _other.isdigit() else (int(_init) if _init.isdigit() else 0)
+                    risk_brief = ""
+                    if _their_uid and _their_uid != my_uid:
+                        risk_brief = await _counterparty_risk(hf, _their_uid)
+                        log.info(f"counterparty risk for cid={cid} uid={_their_uid}: {risk_brief[:60]}")
                     await tg.send(chat_id, tones.fmt_contract(
-                        tone, cid,
+                        cid,
                         contract_type  = ct.get("type", "standard"),
                         iproduct       = ct.get("iproduct") or "N/A",
                         iprice         = ct.get("iprice", "?"),
@@ -461,6 +611,7 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
                         timeout_days   = ct.get("timeout_days"),
                         status         = current_status,
                         terms          = terms,
+                        risk_brief     = risk_brief,
                     ))
                     await _db(mark_event_seen, db_cfg, chat_id, "contract", cid)
 
@@ -477,7 +628,7 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
                 # Skip alert when contract moves to complete — both sides know when it's done
                 if current_status != "complete":
                     await tg.send(chat_id, tones.fmt_contract_status(
-                        tone, cid,
+                        cid,
                         prev_status    = prev_status,
                         new_status     = current_status,
                         iproduct       = ct.get("iproduct", ""),
@@ -516,7 +667,7 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
             if 0 < secs_left < 86400 and status not in ("complete", "cancelled", "disputed"):
                 if not await _db(is_event_seen, db_cfg, chat_id, "contract_expiry", cid):
                     product = ct.get("iproduct", "contract")
-                    await tg.send(chat_id, tones.fmt_contract_expiry(tone, cid, product, hours_left))
+                    await tg.send(chat_id, tones.fmt_contract_expiry(cid, product, hours_left))
                     await _db(mark_event_seen, db_cfg, chat_id, "contract_expiry", cid)
                     log.info(f"contract expiry alert: cid={cid} hours_left={hours_left}")
 
@@ -569,30 +720,59 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
                 dispute_states[cdid] = status
                 ds_changed = True
                 notes = strip_bbcode(d.get("claimantnotes", ""))[:150]
-                await tg.send(chat_id, tones.fmt_dispute_new(tone, cdid, cid, is_defendant, notes))
+                await tg.send(chat_id, tones.fmt_dispute_new(cdid, cid, is_defendant, notes))
             elif status != prev_ds:
                 dispute_states[cdid] = status
                 ds_changed = True
-                await tg.send(chat_id, tones.fmt_dispute_update(tone, cdid, cid, status))
+                await tg.send(chat_id, tones.fmt_dispute_update(cdid, cid, status))
         if dtids_changed:
             await _db(upsert_user, db_cfg, chat_id, {"known_tids": known_tids[-200:]})
 
     if ds_changed:
         await _db(upsert_user, db_cfg, chat_id, {"dispute_states": dispute_states})
 
-    # ── B-Ratings — now polled in slow loop (check_bratings) ──────────────────
-    # Bratings are rare. Moving them to the slow cycle (every 3 min) frees
-    # one endpoint slot from the 4-endpoint medium batch above. Users still
-    # get alerts within ~3 minutes of a rating being posted.
+    # ── B-Ratings — piggybacked into medium batch as 4th endpoint ────────────
+    # Data arrives free every medium cycle; processing is still gated to 30 min
+    # because b-ratings are rare. Eliminates the dedicated slow-loop call entirely.
+    if notifs.get("bratings", True) and "bratings" in data:
+        now_ts             = int(time.time())
+        last_brating_check = int(user.get("last_brating_check_at") or 0)
+        if (now_ts - last_brating_check) >= 1800:
+            await _db(upsert_user, db_cfg, chat_id, {"last_brating_check_at": now_ts})
+            brs = data["bratings"]
+            if isinstance(brs, dict): brs = [brs]
+            linked_at_br = int(user.get("linked_at") or 0) or now_ts
+            # Resolve any unknown fromids using the uid_cache already populated above
+            for b in (brs or []):
+                crid = str(b.get("crid", ""))
+                if not crid or await _db(is_event_seen, db_cfg, chat_id, "brating", crid):
+                    continue
+                dateline_br = int(b.get("dateline") or 0)
+                if dateline_br and dateline_br < linked_at_br:
+                    await _db(mark_event_seen, db_cfg, chat_id, "brating", crid)
+                    continue
+                from_uid = b.get("fromid", "?")
+                await tg.send(chat_id, tones.fmt_brating(
+                    b.get("contractid", "?"),
+                    from_uid,
+                    int(b.get("amount", 0)),
+                    b.get("message", ""),
+                    from_username=_resolve_uid(from_uid),
+                ))
+                await _db(mark_event_seen, db_cfg, chat_id, "brating", crid)
+                log.info(f"brating alert (medium batch): chat_id={chat_id} crid={crid}")
 
     # ── Bytes received ────────────────────────────────────────────────────────
     if notifs.get("bytes", True) and "bytes" in data:
         txs = data["bytes"]
         if isinstance(txs, dict): txs = [txs]
 
-        # Sanitize gambling_pending — belt-and-suspenders for stale DB rows where
-        # _parse_user may not have decoded the JSON string yet.
-        # '[]' as a raw string is truthy → flush fires → iterates chars → int('[') → crash.
+        # Gambling wins accumulate in DB between cycles and flush every 30 min.
+        # Regular (non-gambling) bytes still alert immediately.
+        # Sanitize gambling_pending.
+        # Root issue: MySQL JSON column comes back as a raw string if _parse_user missed it.
+        # '[]' is truthy as a string → flush fires → iterates chars → int('[') → crash.
+        # _parse_user now parses it, but keep this as belt-and-suspenders for stale DB rows.
         _gp_raw = user.get("gambling_pending") or []
         if isinstance(_gp_raw, str):
             try:
@@ -641,11 +821,11 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
             if tones.is_gambling_reason(reason):
                 gambling_pending.append([amount, reason, from_user])
             else:
-                await tg.send(chat_id, tones.fmt_bytes(tone, amount, reason, from_user, post_id, post_tid))
+                await tg.send(chat_id, tones.fmt_bytes(amount, reason, from_user, post_id, post_tid))
 
         # Flush pending gambling wins if 30 min have passed (or we have a backlog)
         if gambling_pending and (now - last_gambling_flush) >= GAMBLING_FLUSH_SECS:
-            await tg.send(chat_id, tones.fmt_bytes_bundle(tone, [tuple(t) for t in gambling_pending]))
+            await tg.send(chat_id, tones.fmt_bytes_bundle([tuple(t) for t in gambling_pending]))
             gambling_pending    = []
             last_gambling_flush = now
 
@@ -659,93 +839,12 @@ async def check_account_events(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
 # ── B-Ratings (slow loop, every 3 min) ────────────────────────────────────────
 
 async def check_bratings(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_cfg: dict):
-    """Standalone b-ratings check — runs at most once per 30 minutes (b-ratings are rare)."""
-    notifs  = user.get("notifications") or {}
-    if not notifs.get("bratings", True):
-        return
-    # Gate: only run every 30 minutes — b-ratings are rare events, no need to poll each slow cycle
-    now_ts = int(time.time())
-    last_brating_check = int(user.get("last_brating_check_at") or 0)
-    if (now_ts - last_brating_check) < 1800:
-        return
-    chat_id  = user["chat_id"]
-    my_uid   = user["hf_uid"]
-    tone     = user.get("tone") or "normal"
-    linked_at = int(user.get("linked_at") or 0) or int(time.time())
-
-    if is_rate_limited(hf.token):
-        return
-    await _db(upsert_user, db_cfg, chat_id, {"last_brating_check_at": now_ts})
-
-    data = await hf.read({
-        "bratings": {
-            "_to":        [my_uid],
-            "_perpage":   30,
-            "crid":       True,
-            "contractid": True,
-            "fromid":     True,
-            "dateline":   True,
-            "amount":     True,
-            "message":    True,
-        }
-    })
-    if not data or "bratings" not in data:
-        return
-
-    # Resolve sender UIDs in one batch call
-    bratings = data["bratings"]
-    if isinstance(bratings, dict): bratings = [bratings]
-    uids_to_resolve = set()
-    for b in (bratings or []):
-        uid = b.get("fromid")
-        if uid and str(uid).isdigit() and int(uid) != my_uid:
-            uids_to_resolve.add(int(uid))
-
-    uid_cache: dict = dict(user.get("uid_cache") or {})
-    uid_usernames: dict = {int(k): v for k, v in uid_cache.items() if k.isdigit()}
-    unknown_uids = {u for u in uids_to_resolve if uid_cache.get(str(u)) is None}
-    if unknown_uids and not is_rate_limited(hf.token):
-        uid_data = await hf.read({
-            "users": {"_uid": list(unknown_uids), "uid": True, "username": True}
-        })
-        if uid_data and "users" in uid_data:
-            rows = uid_data["users"]
-            if isinstance(rows, dict): rows = [rows]
-            for u in (rows or []):
-                try:
-                    n = int(u["uid"])
-                    uid_usernames[n] = u.get("username", "")
-                    uid_cache[str(n)] = u.get("username", "")
-                except (KeyError, ValueError, TypeError): pass
-        if len(uid_cache) > 500:
-            uid_cache = dict(list(uid_cache.items())[-500:])
-        await _db(upsert_user, db_cfg, chat_id, {"uid_cache": uid_cache})
-
-    def _resolve(uid) -> str:
-        if not uid: return ""
-        try: n = int(uid)
-        except (ValueError, TypeError): return str(uid)
-        return uid_usernames.get(n) or f"UID {uid}"
-
-    for b in (bratings or []):
-        crid = str(b.get("crid", ""))
-        if not crid or await _db(is_event_seen, db_cfg, chat_id, "brating", crid):
-            continue
-        dateline = int(b.get("dateline") or 0)
-        if dateline and dateline < linked_at:
-            await _db(mark_event_seen, db_cfg, chat_id, "brating", crid)
-            continue
-        from_uid = b.get("fromid", "?")
-        await tg.send(chat_id, tones.fmt_brating(
-            tone,
-            b.get("contractid", "?"),
-            from_uid,
-            int(b.get("amount", 0)),
-            b.get("message", ""),
-            from_username=_resolve(from_uid),
-        ))
-        await _db(mark_event_seen, db_cfg, chat_id, "brating", crid)
-        log.info(f"brating alert: chat_id={chat_id} crid={crid}")
+    """
+    No-op shim — b-rating detection was moved into check_account_events (medium loop)
+    where it piggybacks on the existing 4-endpoint batch at zero extra API cost.
+    This function is kept so bot.py call sites don't need to change.
+    """
+    return
 
 
 
@@ -758,7 +857,6 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
     chat_id        = user["chat_id"]
     my_uid         = str(user["hf_uid"])
     my_username    = user.get("hf_username", "")
-    tone           = user.get("tone") or "normal"
     now            = int(time.time())
     check_replies  = notifs.get("thread_replies", True)
     check_mentions = notifs.get("mentions", True)
@@ -862,8 +960,8 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
                     if dl > existing:
                         discovery_datelines[tid] = dl
                         own_pids_by_tid[tid] = int(pid) if pid.isdigit() else 0
-            if len(rows) < 50:
-                break  # last page
+            if len(rows) < 30:
+                break  # last page — fewer results than perpage means we hit the end
 
     # Step 1b: Discover threads you CREATED via threads _uid.
     # Only these get reply alerts. known_tids still gets them for mention polling.
@@ -882,9 +980,8 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
     # so we can skip the sweep entirely (saves 1 API call per 30-min window).
     last_own_tids_at     = int(user.get("last_discovery_at") or 0)
     current_threadnum    = int(user.get("last_threadnum") or 0)
-    prev_threadnum_seen  = int(user.get("_last_seen_threadnum") or 0)
+    prev_threadnum_seen  = int(user.get("last_discovery_threadnum") or 0)
     threadnum_changed    = (current_threadnum != prev_threadnum_seen) or (current_threadnum == 0)
-    user["_last_seen_threadnum"] = current_threadnum
     run_own_tids = (not own_tids_bootstrapped) or (
         (now - last_own_tids_at) > 1800 and threadnum_changed
     ) or (not own_tids_bootstrapped)
@@ -1026,7 +1123,7 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
                 if mention_type and not await _db(is_event_seen, db_cfg, chat_id, "mention", pid):
                     snippet = strip_bbcode(strip_quote_blocks(message))[:SNIPPET_LEN]
                     await tg.send(chat_id,
-                        tones.fmt_mention(tone, subject_bt, btid_str, pid, snippet, mention_type),
+                        tones.fmt_mention(subject_bt, btid_str, pid, snippet, mention_type),
                         reply_markup=_mute_button(btid_str)
                     )
                     await _db(mark_event_seen, db_cfg, chat_id, "mention", pid)
@@ -1035,7 +1132,7 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
                 elif check_replies and not await _db(is_event_seen, db_cfg, chat_id, "reply", pid):
                     snippet = strip_bbcode(message)[:SNIPPET_LEN]
                     await tg.send(chat_id,
-                        tones.fmt_reply(tone, subject_bt, btid_str, pid, snippet, replier=username),
+                        tones.fmt_reply(subject_bt, btid_str, pid, snippet, replier=username),
                         reply_markup=_mute_button(btid_str)
                     )
                     await _db(mark_event_seen, db_cfg, chat_id, "reply", pid)
@@ -1044,6 +1141,10 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
     if run_discovery and current_postnum:
         # Persist the postnum we acted on — next cycle compares against this to gate discovery
         await _db(upsert_user, db_cfg, chat_id, {"last_discovery_postnum": current_postnum})
+
+    if run_own_tids and current_threadnum:
+        # Persist the threadnum we acted on — next cycle compares to gate own_tids sweep
+        await _db(upsert_user, db_cfg, chat_id, {"last_discovery_threadnum": current_threadnum})
 
     if run_own_tids:
         # Stamp when own_tids sweep ran so the 30-min gate works
@@ -1235,14 +1336,14 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
 
         # Best answer alert — someone marked a post as best in your thread
         if bestpid and bestpid != prev_bestpid and tid in own_tids and bestpid != "0":
-            await tg.send(chat_id, tones.fmt_best_answer(tone, subject, tid, bestpid))
+            await tg.send(chat_id, tones.fmt_best_answer(subject, tid, bestpid))
             log.info(f"Best answer: tid={tid} bestpid={bestpid} chat_id={chat_id}")
 
         # View spike alert — 500+ views in one polling cycle (thread going viral or mod review)
         VIEW_SPIKE = 500
         if prev_views and views > 0 and (views - prev_views) >= VIEW_SPIKE and tid in own_tids:
             spike = views - prev_views
-            await tg.send(chat_id, tones.fmt_view_spike(tone, subject, tid, spike, views))
+            await tg.send(chat_id, tones.fmt_view_spike(subject, tid, spike, views))
             log.info(f"View spike: tid={tid} +{spike} views chat_id={chat_id}")
 
         if prev_lastpost == 0:
@@ -1337,10 +1438,9 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
                         continue  # thread is muted by this user
                     o_mention = find_mention(message, o_uid, o_username)
                     if o_mention and not await _db(is_event_seen, db_cfg, o_chat_id, "mention", pid):
-                        o_tone  = other.get("tone") or "normal"
                         snippet = strip_bbcode(strip_quote_blocks(message))[:SNIPPET_LEN]
                         await tg.send(o_chat_id,
-                            tones.fmt_mention(o_tone, subject, tid, pid, snippet, o_mention),
+                            tones.fmt_mention(subject, tid, pid, snippet, o_mention),
                             reply_markup=_mute_button(tid)
                         )
                         await _db(mark_event_seen, db_cfg, o_chat_id, "mention", pid)
@@ -1364,7 +1464,7 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
             if mention_type and not await _db(is_event_seen, db_cfg, chat_id, "mention", pid):
                 snippet = strip_bbcode(strip_quote_blocks(message))[:SNIPPET_LEN]
                 await tg.send(chat_id,
-                    tones.fmt_mention(tone, subject, tid, pid, snippet, mention_type),
+                    tones.fmt_mention(subject, tid, pid, snippet, mention_type),
                     reply_markup=_mute_button(tid)
                 )
                 await _db(mark_event_seen, db_cfg, chat_id, "mention", pid)
@@ -1374,7 +1474,7 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
                 # Alert on replies in threads YOU created OR posted in
                 snippet = strip_bbcode(message)[:SNIPPET_LEN]
                 await tg.send(chat_id,
-                    tones.fmt_reply(tone, subject, tid, pid, snippet, replier=username),
+                    tones.fmt_reply(subject, tid, pid, snippet, replier=username),
                     reply_markup=_mute_button(tid)
                 )
                 await _db(mark_event_seen, db_cfg, chat_id, "reply", pid)
@@ -1403,12 +1503,11 @@ async def check_fid_threads(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict
     """
     notifs      = user.get("notifications") or {}
     chat_id     = user["chat_id"]
-    tone        = user.get("tone") or "normal"
     now         = int(time.time())
 
     tracked_fids  = list(user.get("tracked_fids") or [])
     last_fid_poll = int(user.get("last_fid_poll_at") or 0)
-    FID_INTERVAL  = 600   # 10 minutes — new threads don't post faster than this
+    FID_INTERVAL  = 900   # 15 minutes — was 10min (6/hr). New threads don't post faster than this.
 
     if not tracked_fids:
         return
@@ -1420,16 +1519,14 @@ async def check_fid_threads(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict
         log.info(f"check_fid_threads skipped: rate limited chat_id={chat_id}")
         return
 
-    await _db(upsert_user, db_cfg, chat_id, {"last_fid_poll_at": now})
-
-    alert_cutoff     = now - (6 * 3600)
+    alert_cutoff = now - (6 * 3600)
 
     fid_meta = {fw.get("fid"): fw for fw in tracked_fids if fw.get("fid")}
     all_fids = [int(fid) for fid in fid_meta.keys()]
     if not all_fids:
         return
 
-    perpage  = min(30 * len(all_fids), 100)   # 30 results per forum, API cap 100
+    perpage  = 30   # API hard max for _perpage — applies globally, not per-fid
     fid_data = await hf.read({
         "threads": {
             "_fid":      all_fids,
@@ -1444,9 +1541,18 @@ async def check_fid_threads(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict
             "firstpost": True,
         }
     })
-    if not fid_data or "threads" not in fid_data:
-        log.warning(f"check_fid_threads: no data for fids={all_fids} chat_id={chat_id}")
+    if fid_data is None:
+        # Transient relay failure — don't burn the cooldown, retry next cycle
+        log.warning(f"check_fid_threads: relay returned None for fids={all_fids} chat_id={chat_id} — will retry next cycle")
         return
+    if "threads" not in fid_data:
+        # API responded but no threads key — forums may be empty or restricted
+        log.info(f"check_fid_threads: no threads key in response for fids={all_fids} chat_id={chat_id}")
+        await _db(upsert_user, db_cfg, chat_id, {"last_fid_poll_at": now})
+        return
+
+    # Success — stamp the cooldown now
+    await _db(upsert_user, db_cfg, chat_id, {"last_fid_poll_at": now})
 
     frows = fid_data["threads"]
     if isinstance(frows, dict): frows = [frows]
@@ -1479,7 +1585,7 @@ async def check_fid_threads(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict
         snippet = strip_bbcode(fp.get("message", "") if isinstance(fp, dict) else "")[:SNIPPET_LEN]
         log.info(f"FID alert: fid={fid} fname={fname} tid={ftid} chat_id={chat_id}")
         await tg.send(chat_id, tones.fmt_fid_thread(
-            tone, fname, fid, fsubject, ftid, fusername, snippet
+            fname, fid, fsubject, ftid, fusername, snippet
         ))
 
 
@@ -1490,11 +1596,22 @@ async def check_buddy_activity(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
 
     chat_id    = user["chat_id"]
     buddy_list = user.get("buddy_list") or []
-    tone       = user.get("tone") or "normal"
     notifs     = user.get("notifications") or {}
 
     if not buddy_list:
         return
+
+    # ── Dynamic gate: scale with buddy count ──────────────────────────────────
+    # 90s × buddy count gives comfortable headroom. At 3 buddies = 270s, we fire
+    # ~13x/hr instead of ~20x/hr. Combined with batching (1 call vs N), that's
+    # 13 calls/hr for buddies instead of 60 — a 78% reduction.
+    BUDDY_INTERVAL = max(270, 90 * len(buddy_list))
+    now_ts         = int(time.time())
+    last_buddy     = int(user.get("last_buddy_check_at") or 0)
+    if (now_ts - last_buddy) < BUDDY_INTERVAL:
+        log.info(f"check_buddy_activity: skipping ({now_ts - last_buddy}s < {BUDDY_INTERVAL}s gate) chat_id={chat_id}")
+        return
+    await _db(upsert_user, db_cfg, chat_id, {"last_buddy_check_at": now_ts})
 
     now          = int(time.time())
     alert_cutoff = now - (6 * 3600)
@@ -1502,152 +1619,208 @@ async def check_buddy_activity(user: dict, hf: HFClient, tg: TelegramBot, cfg: d
     EXILED_UG    = {"7"}
     BANNED_UG    = {"38"}
 
-    # uid str → buddy dict — for mapping batch response rows back to their buddy
     buddy_by_uid = {str(b["uid"]): b for b in buddy_list if b.get("uid")}
 
-    # ── Batch 1: threads — one call for ALL buddies ───────────────────────────
-    # threads _uid accepts a list; each result includes a uid field. N calls → 1.
-    all_uids = [int(b["uid"]) for b in buddy_list if b.get("uid")]
-    if all_uids:
-        thread_data = await hf.read({
-            "threads": {
-                "_uid":     all_uids,
-                "_page":    1,
-                "_perpage": 30,
-                "tid":      True,
-                "uid":      True,
-                "subject":  True,
-                "dateline": True,
-            }
-        })
-        if not thread_data or "threads" not in thread_data:
-            log.warning("503/timeout fetching batched buddy threads")
-        else:
-            rows = thread_data["threads"]
-            if isinstance(rows, dict): rows = [rows]
-            log.info(f"buddy threads batch: {len(rows or [])} threads for {len(all_uids)} buddies")
-            for t in (rows or []):
-                row_uid   = str(t.get("uid", ""))
-                buddy     = buddy_by_uid.get(row_uid)
-                if not buddy:
-                    continue
-                uid       = str(buddy["uid"])
-                username  = buddy.get("username", f"UID {uid}")
-                added_at  = int(buddy.get("added_at") or 0)
-                ns_thread = f"buddy_thread_{uid}"
-                tid       = str(t.get("tid", ""))
-                subject   = t.get("subject", "")
-                dateline  = int(t.get("dateline") or 0)
-                if not tid:
-                    continue
-                too_old  = (added_at and dateline < added_at) or dateline < alert_cutoff
-                tid_seen = await _db(is_event_seen, db_cfg, chat_id, ns_thread, tid)
-                if tid_seen:
-                    continue
-                await _db(mark_event_seen, db_cfg, chat_id, ns_thread, tid)
-                if too_old:
-                    continue
-                log.info(f"buddy thread alert: uid={uid} username={username} tid={tid}")
-                await tg.send(chat_id, tones.fmt_buddy_thread(tone, username, subject, tid))
+    # ── Single batched call: threads + posts for ALL buddies at once ──────────
+    # Pass all UIDs to _uid — API returns results from all, separated by the uid
+    # field in each row. 3 buddies = 1 call instead of 3. Slots used:
+    #   slot 1: threads for all buddy UIDs
+    #   slot 2: posts for mode=all buddy UIDs (if any)
+    #   slot 3: users for usergroup-due UIDs (if any, fits when < 4 slots used)
+    # _perpage:30 is shared across all buddies — at 180s cadence, 30 total results
+    # is plenty; no buddy posts faster than 10 times in 3 minutes.
+    if is_rate_limited(hf.token):
+        log.warning(f"check_buddy_activity: rate limited, skipping chat_id={chat_id}")
+        return
 
-    # ── Batch 2: usergroup checks — one call for all buddies due ──────────────
+    all_thread_uids = [int(b["uid"]) for b in buddy_list if b.get("uid")]
+    all_post_uids   = [int(b["uid"]) for b in buddy_list
+                       if b.get("uid") and b.get("mode", "threads") == "all"]
+
+    # Determine which buddies need a usergroup check (every 4 hours)
+    ug_due_uids = []
     if notifs.get("buddy_status", True):
-        ug_due_uids = []
         for b in buddy_list:
             uid        = str(b.get("uid", ""))
             ug_entry   = buddy_ugs.get(uid)
             last_check = int((ug_entry or {}).get("checked_at", 0)) if isinstance(ug_entry, dict) else 0
-            if (now - last_check) >= 14400:   # 4h — bans/exiles are rare, hourly was wasteful
+            if (now - last_check) >= 14400:
                 ug_due_uids.append(int(uid))
-        if ug_due_uids:
-            ug_data = await hf.read({
-                "users": {
-                    "_uid":      ug_due_uids,
-                    "uid":       True,
-                    "usergroup": True,
-                }
-            })
-            if ug_data and "users" in ug_data:
-                u_rows = ug_data["users"]
-                if isinstance(u_rows, dict): u_rows = [u_rows]
-                for u in (u_rows or []):
-                    uid        = str(u.get("uid", ""))
-                    buddy      = buddy_by_uid.get(uid)
-                    if not buddy:
-                        continue
-                    username   = buddy.get("username", f"UID {uid}")
-                    current_ug = str(u.get("usergroup", ""))
-                    ug_entry   = buddy_ugs.get(uid)
-                    prev_ug    = str((ug_entry or {}).get("ug", "")) if isinstance(ug_entry, dict) else str(ug_entry or "")
-                    if prev_ug and current_ug != prev_ug:
-                        if current_ug in EXILED_UG:
-                            await tg.send(chat_id, tones.fmt_buddy_status(tone, username, uid, "exiled"))
-                            log.info(f"buddy exiled: uid={uid} username={username} ug={current_ug}")
-                        elif current_ug in BANNED_UG:
-                            await tg.send(chat_id, tones.fmt_buddy_status(tone, username, uid, "banned"))
-                            log.info(f"buddy banned: uid={uid} username={username} ug={current_ug}")
-                    buddy_ugs[uid] = {"ug": current_ug, "checked_at": now}
-                await _db(upsert_user, db_cfg, chat_id, {"buddy_usergroups": buddy_ugs})
-                user["buddy_usergroups"] = buddy_ugs
 
-    # ── Batch 3: posts — one call for all mode=all buddies ────────────────────
-    mode_all_uids = [int(b["uid"]) for b in buddy_list if b.get("uid") and b.get("mode") == "all"]
-    log.info(f"check_buddy_activity: mode=all uids={mode_all_uids} for chat_id={chat_id}")
-    if mode_all_uids:
-        post_data = await hf.read({
-            "posts": {
-                "_uid":     mode_all_uids,
-                "_page":    1,
-                "_perpage": 30,
-                "pid":      True,
-                "uid":      True,
-                "tid":      True,
-                "dateline": True,
-                "message":  True,
-                "subject":  True,
-            }
-        })
-        if not post_data or "posts" not in post_data:
-            log.warning("503/timeout fetching batched buddy posts (mode=all)")
-        else:
-            from collections import defaultdict
-            posts_by_uid: dict = defaultdict(list)
-            raw = post_data["posts"]
-            if isinstance(raw, dict): raw = [raw]
-            for p in raw:
-                posts_by_uid[str(p.get("uid", ""))].append(p)
-            for uid_str, uid_posts in posts_by_uid.items():
-                buddy    = buddy_by_uid.get(uid_str)
+    # Build the batch (max 4 endpoints)
+    asks: dict = {
+        "threads": {
+            "_uid":     all_thread_uids,
+            "_page":    1,
+            "_perpage": 30,
+            "tid":      True,
+            "uid":      True,
+            "subject":  True,
+            "dateline": True,
+        }
+    }
+    if all_post_uids:
+        asks["posts"] = {
+            "_uid":     all_post_uids,
+            "_page":    1,
+            "_perpage": 30,
+            "pid":      True,
+            "uid":      True,
+            "tid":      True,
+            "dateline": True,
+            "message":  True,
+            "subject":  True,
+        }
+    if ug_due_uids and len(asks) < 4:
+        asks["users"] = {
+            "_uid":      ug_due_uids,
+            "uid":       True,
+            "usergroup": True,
+        }
+
+    log.info(
+        f"check_buddy_activity: batch call — {len(all_thread_uids)} thread UIDs, "
+        f"{len(all_post_uids)} post UIDs, {len(ug_due_uids)} UG UIDs — "
+        f"{len(asks)} endpoints — chat_id={chat_id}"
+    )
+    data = await hf.read(asks)
+    if not data:
+        log.warning(f"check_buddy_activity: 503/timeout chat_id={chat_id}")
+        return
+
+    # Index thread + post results by uid for O(1) per-buddy lookup
+    from collections import defaultdict
+    threads_by_uid: dict = defaultdict(list)
+    posts_by_uid:   dict = defaultdict(list)
+
+    raw_threads = data.get("threads") or []
+    if isinstance(raw_threads, dict): raw_threads = [raw_threads]
+    for t in raw_threads:
+        uid_key = str(t.get("uid", ""))
+        if uid_key:
+            threads_by_uid[uid_key].append(t)
+
+    raw_posts = data.get("posts") or []
+    if isinstance(raw_posts, dict): raw_posts = [raw_posts]
+    for p in raw_posts:
+        uid_key = str(p.get("uid", ""))
+        if uid_key:
+            posts_by_uid[uid_key].append(p)
+
+    # ── Process threads + posts per buddy from indexed results ─────────────────
+    for buddy in buddy_list:
+        if not buddy.get("uid"):
+            continue
+        uid      = str(buddy["uid"])
+        username = buddy.get("username", f"UID {uid}")
+        added_at = int(buddy.get("added_at") or 0)
+        mode     = buddy.get("mode", "threads")
+
+        buddy_threads = threads_by_uid.get(uid, [])
+        buddy_posts   = posts_by_uid.get(uid, []) if mode == "all" else []
+
+        log.info(f"buddy threads: uid={uid} username={username} returned {len(buddy_threads)} threads")
+
+        # ── Threads ──────────────────────────────────────────────────────────
+        ns_thread = f"buddy_thread_{uid}"
+        for t in buddy_threads:
+            tid      = str(t.get("tid", ""))
+            subject  = t.get("subject", "")
+            dateline = int(t.get("dateline") or 0)
+            if not tid:
+                continue
+            too_old  = (added_at and dateline < added_at) or dateline < alert_cutoff
+            tid_seen = await _db(is_event_seen, db_cfg, chat_id, ns_thread, tid)
+            if tid_seen:
+                continue
+            await _db(mark_event_seen, db_cfg, chat_id, ns_thread, tid)
+            if too_old:
+                continue
+            log.info(f"buddy thread alert: uid={uid} username={username} tid={tid}")
+            await tg.send(chat_id, tones.fmt_buddy_thread(username, subject, tid))
+
+        # ── Posts (mode=all only) ─────────────────────────────────────────────
+        if mode == "all" and buddy_posts:
+            ns_post   = f"buddy_post_{uid}"
+            buddy_posts.sort(key=lambda p: int(p.get("dateline") or 0), reverse=True)
+            log.info(f"buddy posts: uid={uid} username={username} returned {len(buddy_posts)} posts")
+            for p in buddy_posts:
+                pid      = str(p.get("pid", ""))
+                tid      = str(p.get("tid", ""))
+                subject  = p.get("subject", "")
+                dateline = int(p.get("dateline") or 0)
+                if not pid or not tid:
+                    continue
+                too_old  = (added_at and dateline < added_at) or dateline < alert_cutoff
+                pid_seen = await _db(is_event_seen, db_cfg, chat_id, ns_post, pid)
+                if pid_seen:
+                    break  # sorted newest-first — everything after is older
+                await _db(mark_event_seen, db_cfg, chat_id, ns_post, pid)
+                if too_old:
+                    continue
+                snippet = strip_bbcode(p.get("message", ""))[:SNIPPET_LEN]
+                log.info(f"buddy post alert: uid={uid} username={username} pid={pid} tid={tid}")
+                await tg.send(chat_id, tones.fmt_buddy_post(username, subject, tid, pid, snippet))
+
+    # ── Usergroup checks — results already in the batch ───────────────────────
+    if ug_due_uids and "users" in data and notifs.get("buddy_status", True):
+        u_rows = data["users"]
+        if isinstance(u_rows, dict): u_rows = [u_rows]
+        for u in (u_rows or []):
+            uid        = str(u.get("uid", ""))
+            buddy      = buddy_by_uid.get(uid)
+            if not buddy:
+                continue
+            username   = buddy.get("username", f"UID {uid}")
+            current_ug = str(u.get("usergroup", ""))
+            ug_entry   = buddy_ugs.get(uid)
+            prev_ug    = str((ug_entry or {}).get("ug", "")) if isinstance(ug_entry, dict) else str(ug_entry or "")
+            if prev_ug and current_ug != prev_ug:
+                if current_ug in EXILED_UG:
+                    await tg.send(chat_id, tones.fmt_buddy_status(username, uid, "exiled"))
+                    log.info(f"buddy exiled: uid={uid} username={username} ug={current_ug}")
+                elif current_ug in BANNED_UG:
+                    await tg.send(chat_id, tones.fmt_buddy_status(username, uid, "banned"))
+                    log.info(f"buddy banned: uid={uid} username={username} ug={current_ug}")
+            buddy_ugs[uid] = {"ug": current_ug, "checked_at": now}
+    elif ug_due_uids and "users" not in data and notifs.get("buddy_status", True):
+        # UG check couldn't fit in the batch (e.g. slot limit) — fire a separate call
+        ug_data = await hf.read({"users": {"_uid": ug_due_uids, "uid": True, "usergroup": True}})
+        if ug_data and "users" in ug_data:
+            u_rows = ug_data["users"]
+            if isinstance(u_rows, dict): u_rows = [u_rows]
+            for u in (u_rows or []):
+                uid        = str(u.get("uid", ""))
+                buddy      = buddy_by_uid.get(uid)
                 if not buddy:
                     continue
-                username = buddy.get("username", f"UID {uid_str}")
-                added_at = int(buddy.get("added_at") or 0)
-                ns_post  = f"buddy_post_{uid_str}"
-                uid_posts.sort(key=lambda p: int(p.get("dateline") or 0), reverse=True)
-                for p in uid_posts:
-                    pid      = str(p.get("pid", ""))
-                    tid      = str(p.get("tid", ""))
-                    subject  = p.get("subject", "")
-                    dateline = int(p.get("dateline") or 0)
-                    if not pid or not tid:
-                        continue
-                    too_old  = (added_at and dateline < added_at) or dateline < alert_cutoff
-                    pid_seen = await _db(is_event_seen, db_cfg, chat_id, ns_post, pid)
-                    if pid_seen:
-                        break  # sorted newest-first — everything after is older
-                    await _db(mark_event_seen, db_cfg, chat_id, ns_post, pid)
-                    if too_old:
-                        continue
-                    snippet = strip_bbcode(p.get("message", ""))[:SNIPPET_LEN]
-                    log.info(f"buddy post alert: uid={uid_str} username={username} pid={pid}")
-                    await tg.send(chat_id, tones.fmt_buddy_post(tone, username, subject, tid, pid, snippet))
+                username   = buddy.get("username", f"UID {uid}")
+                current_ug = str(u.get("usergroup", ""))
+                ug_entry   = buddy_ugs.get(uid)
+                prev_ug    = str((ug_entry or {}).get("ug", "")) if isinstance(ug_entry, dict) else str(ug_entry or "")
+                if prev_ug and current_ug != prev_ug:
+                    if current_ug in EXILED_UG:
+                        await tg.send(chat_id, tones.fmt_buddy_status(username, uid, "exiled"))
+                    elif current_ug in BANNED_UG:
+                        await tg.send(chat_id, tones.fmt_buddy_status(username, uid, "banned"))
+                buddy_ugs[uid] = {"ug": current_ug, "checked_at": now}
+
+    if ug_due_uids:
+        await _db(upsert_user, db_cfg, chat_id, {"buddy_usergroups": buddy_ugs})
+        user["buddy_usergroups"] = buddy_ugs
 
 
 
+
+
+async def check_expiry(user: dict, tg: TelegramBot, cfg: dict, db_cfg: dict):
+    pass  # Trial system removed — HF Radar is free with no trial period
 
 
 # Aliases so existing imports keep working
 check_buddy_threads = check_buddy_activity
+check_token_expiry  = check_expiry
+# check_bratings is already defined as a standalone function above
 
 
 # ── Dispute safety net (slow loop) ────────────────────────────────────────────
@@ -1662,12 +1835,20 @@ async def check_disputes(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, d
     """
     chat_id = user["chat_id"]
     my_uid  = user["hf_uid"]
-    tone    = user.get("tone") or "normal"
 
     # Only run for users who have ever opened a contract
     if not user.get("contract_states"):
         log.info(f"check_disputes skipped: no contract_states chat_id={chat_id}")
         return
+
+    # Gate: embedded idispute/odispute in check_account_events handles real-time detection.
+    # This function is a safety net for old contracts only — 30-min cadence is plenty.
+    now_ts = int(time.time())
+    last_dc = int(user.get("last_dispute_check_at") or 0)
+    if (now_ts - last_dc) < 1800:
+        log.info(f"check_disputes skipped: {now_ts - last_dc}s since last check chat_id={chat_id}")
+        return
+    await _db(upsert_user, db_cfg, chat_id, {"last_dispute_check_at": now_ts})
 
     if is_rate_limited(hf.token):
         log.info(f"check_disputes skipped: rate limited chat_id={chat_id}")
@@ -1729,13 +1910,13 @@ async def check_disputes(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, d
             ds_changed = True
             if not await _db(is_event_seen, db_cfg, chat_id, "dispute", cdid):
                 notes = strip_bbcode(d.get("claimantnotes", ""))[:150]
-                await tg.send(chat_id, tones.fmt_dispute_new(tone, cdid, cid, is_defendant, notes))
+                await tg.send(chat_id, tones.fmt_dispute_new(cdid, cid, is_defendant, notes))
                 await _db(mark_event_seen, db_cfg, chat_id, "dispute", cdid)
                 log.info(f"dispute safety net: cdid={cdid} cid={cid} chat_id={chat_id}")
         elif status != prev_ds:
             dispute_states[cdid] = status
             ds_changed = True
-            await tg.send(chat_id, tones.fmt_dispute_update(tone, cdid, cid, status))
+            await tg.send(chat_id, tones.fmt_dispute_update(cdid, cid, status))
 
     if dtids_changed:
         await _db(upsert_user, db_cfg, chat_id, {"known_tids": known_tids[-200:]})
