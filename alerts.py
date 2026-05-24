@@ -1,12 +1,19 @@
 """
 Alert message formatting.
 """
+from html import escape as _html_escape
+
+
+def _e(s) -> str:
+    """HTML-escape a user-provided string for safe Telegram HTML mode output."""
+    return _html_escape(str(s)) if s is not None else ""
+
 
 
 def fmt_reply(tone: str, subject: str, tid, pid, snippet: str, replier: str = "") -> str:
     url = f"hackforums.net/showthread.php?tid={tid}&pid={pid}#pid{pid}"
-    who = replier if replier else "someone"
-    return f"💬 {who} replied to <i>{subject}</i>\n🔗 {url}\n\n{snippet}"
+    who = _e(replier) if replier else "someone"
+    return f"💬 {who} replied to <i>{_e(subject)}</i>\n🔗 {url}\n\n{_e(snippet)}"
 
 
 def fmt_pm(tone: str, count: int, total: int) -> str:
@@ -121,7 +128,7 @@ def fmt_dispute_update(tone: str, cdid, cid, status: str) -> str:
 def fmt_brating(tone: str, cid, fromid, amount: int, message: str, from_username: str = "") -> str:
     sign      = "👍" if amount > 0 else ("😐" if amount == 0 else "👎")
     plus      = "+" if amount > 0 else ""
-    msg_line  = f'"{message}"\n' if message else ""
+    msg_line  = f'"{_e(message)}"\n' if message else ""
     url       = f"🔗 hackforums.net/contracts.php?action=view&cid={cid}"
     from_disp = from_username if from_username else f"UID {fromid}"
     return (

@@ -332,9 +332,15 @@ async def handle_balance(chat_id: int, tg: TelegramBot, db_cfg: dict):
 
     uids_to_resolve = set()
     for tx in txs:
-        uid = tx.get("from")
-        if uid and str(uid).isdigit() and int(uid) != my_uid:
-            uids_to_resolve.add(int(uid))
+        _from_raw = tx.get("from") or []
+        raw_from_uid = ""
+        if isinstance(_from_raw, list) and _from_raw:
+            _fi = _from_raw[0]
+            raw_from_uid = str(_fi.get("uid", "") if isinstance(_fi, dict) else _fi)
+        elif isinstance(_from_raw, (str, int)) and str(_from_raw).isdigit():
+            raw_from_uid = str(_from_raw)
+        if raw_from_uid and raw_from_uid.isdigit() and int(raw_from_uid) != my_uid:
+            uids_to_resolve.add(int(raw_from_uid))
 
     uid_names: dict = {}
     if uids_to_resolve:
@@ -367,10 +373,16 @@ async def handle_balance(chat_id: int, tg: TelegramBot, db_cfg: dict):
     for tx in txs[:10]:
         amount   = int(float(tx.get("amount", 0) or 0))
         reason   = (tx.get("reason") or "").strip()
-        from_uid = tx.get("from")
+        _from_raw2   = tx.get("from") or []
+        from_uid     = ""
+        if isinstance(_from_raw2, list) and _from_raw2:
+            _fi2 = _from_raw2[0]
+            from_uid = str(_fi2.get("uid", "") if isinstance(_fi2, dict) else _fi2)
+        elif isinstance(_from_raw2, (str, int)) and str(_from_raw2).isdigit():
+            from_uid = str(_from_raw2)
         tx_type  = str(tx.get("type", ""))
         dl       = int(tx.get("dateline") or 0)
-        sender   = _resolve(from_uid) if from_uid and str(from_uid).isdigit() else ""
+        sender   = _resolve(from_uid) if from_uid and from_uid.isdigit() else ""
 
         # Date: "today HH:MM" or "Mar 01"
         if dl:

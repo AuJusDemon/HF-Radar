@@ -9,6 +9,7 @@ import concurrent.futures
 import datetime
 import json
 import logging
+import os
 import sys
 import time
 import io
@@ -19,6 +20,26 @@ if hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 if hasattr(sys.stderr, 'buffer'):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# ── Windows: must set before any asyncio use ──────────────────────────────────
+if sys.platform == "win32":
+    # SelectorEventLoop is required for aiohttp on Windows — ProactorEventLoop
+    # (the default since Python 3.8) causes aiohttp to hang and freeze.
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # Disable Quick Edit Mode — without this, clicking the terminal window
+    # pauses the entire process, which looks like a freeze/crash.
+    try:
+        import ctypes, ctypes.wintypes
+        _k32 = ctypes.windll.kernel32
+        _h   = _k32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        _m   = ctypes.wintypes.DWORD()
+        _k32.GetConsoleMode(_h, ctypes.byref(_m))
+        _m.value &= ~0x0040                    # clear ENABLE_QUICK_EDIT_MODE
+        _m.value &= ~0x0020                    # clear ENABLE_INSERT_MODE
+        _k32.SetConsoleMode(_h, _m)
+    except Exception:
+        pass  # not a real console (running headless / as a service)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,20 +77,52 @@ from telegram.ext import (
 from telegram.error import TimedOut, NetworkError
 
 from db           import init_db, get_all_active_users, get_pending_auth, remove_pending_auth, get_user, upsert_user, get_loop_last_ran, set_loop_last_ran, prune_seen_events
-from hf_client    import HFClient, AuthExpired, get_rate_limit_remaining
+from hf_client    import HFClient, AuthExpired, get_rate_limit_remaining, configure as configure_hf
 from telegram_bot import TelegramBot, radar_keyboard, radar_text
 from commands     import handle_start, handle_radar, handle_cancel, handle_help, handle_text, handle_callback, handle_test, build_auth_url, handle_whois, handle_balance
 from detectors    import check_account_events, check_posts, check_fid_threads, check_buddy_threads, check_bratings, check_disputes
 
-CONFIG_FILE = Path("config.json")
-
-
 def load_config() -> dict:
-    if not CONFIG_FILE.exists():
-        log.error("config.json not found.")
+    """
+    Load configuration from .env (preferred) or config.json (fallback).
+
+    .env takes priority — set TELEGRAM_TOKEN and at minimum the other required
+    vars. config.json is the legacy format and still fully supported.
+    """
+    # ── Try .env ──────────────────────────────────────────────────────────────
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed — that's fine, config.json will be used
+
+    if not os.environ.get("TELEGRAM_TOKEN"):
+        log.error("TELEGRAM_TOKEN not set. Copy .env.example → .env and fill in your values.")
         raise SystemExit(1)
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+
+    # Build database config — MySQL if DB_HOST is set, SQLite otherwise
+    db_host = os.environ.get("DB_HOST", "")
+    if db_host:
+        db_cfg = {
+            "db_host":     db_host,
+            "db_user":     os.environ.get("DB_USER", ""),
+            "db_password": os.environ.get("DB_PASSWORD", ""),
+            "db_name":     os.environ.get("DB_NAME", ""),
+        }
+    else:
+        db_cfg = {"db_path": os.environ.get("DB_PATH", "hfradar.db")}
+
+    return {
+        "telegram_token":        os.environ["TELEGRAM_TOKEN"],
+        "test_chat_id":          int(os.environ.get("TEST_CHAT_ID", "0")),
+        "hf_client_id":          os.environ.get("HF_CLIENT_ID", ""),
+        "hf_client_secret":      os.environ.get("HF_CLIENT_SECRET", ""),
+        "hf_proxy_url":          os.environ.get("HF_PROXY_URL", ""),
+        "vps_relay":             os.environ.get("VPS_RELAY", ""),
+        "proxy_secret":          os.environ.get("PROXY_SECRET", ""),
+        "startup_delay_seconds": int(os.environ.get("STARTUP_DELAY_SECONDS", "0")),
+        "database":              db_cfg,
+    }
 
 
 def _get(context: ContextTypes.DEFAULT_TYPE):
@@ -170,7 +223,7 @@ async def _run_medium(user, hf, tg, cfg, db_cfg):
 
 async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
     chat_id = user.get("chat_id")
-    
+
     async def _handle_auth_expired():
         """Nuke token and notify user on 401."""
         from db import upsert_user as _upsert
@@ -181,7 +234,7 @@ async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
             "All your settings have been saved.\n\n"
             "Use /start to reconnect and pick up where you left off."
         )
-    
+
     try:
         await asyncio.wait_for(check_posts(user, hf, tg, cfg, db_cfg, other_users=other_users), timeout=50)
     except AuthExpired:
@@ -192,8 +245,6 @@ async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
     except Exception as e:
         log.warning(f"check_posts error chat_id={chat_id}: {e}")
 
-    # FID forum watching runs independently — not inside check_posts — so it
-    # always gets its own timeout budget regardless of how long thread polling ran.
     try:
         await asyncio.wait_for(check_fid_threads(user, hf, tg, cfg, db_cfg), timeout=20)
     except AuthExpired:
@@ -204,7 +255,6 @@ async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
     except Exception as e:
         log.warning(f"check_fid_threads error chat_id={chat_id}: {e}")
 
-    # B-ratings moved from medium loop — rare events, 3-min cadence is fine
     try:
         await asyncio.wait_for(check_bratings(user, hf, tg, cfg, db_cfg), timeout=15)
     except AuthExpired:
@@ -215,7 +265,6 @@ async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
     except Exception as e:
         log.warning(f"check_bratings error chat_id={chat_id}: {e}")
 
-    # Disputes safety net — catches disputes on old contracts that aged out of contract_states
     try:
         await asyncio.wait_for(check_disputes(user, hf, tg, cfg, db_cfg), timeout=15)
     except AuthExpired:
@@ -225,7 +274,6 @@ async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
         log.warning(f"check_disputes timed out chat_id={chat_id}")
     except Exception as e:
         log.warning(f"check_disputes error chat_id={chat_id}: {e}")
-
 
     buddies = user.get("buddy_list") or []
     active_buddies = []
@@ -396,7 +444,7 @@ async def schedule_loop(tg, cfg, db_cfg):
       - Daily balance snapshot (written to balance_history for /balance command)
       - Weekly digest (pure DB aggregation, zero API calls, default Monday 9 AM)
     """
-    INTERVAL = 300   # 5 minutes
+    INTERVAL       = 300   # 5 minutes
     PRUNE_INTERVAL = 86400  # prune seen_events once a day
     while True:
         await asyncio.sleep(INTERVAL)
@@ -441,13 +489,31 @@ async def schedule_loop(tg, cfg, db_cfg):
                     await _db(upsert_user, db_cfg, chat_id, snap)
 
                 # ── Weekly digest ────────────────────────────────────────────
-                # Default: Monday (weekday 0), 09:00 local — stored as
-                # last_digest_at epoch. Fire if >= 7 days since last send.
                 last_digest = int(user.get("last_digest_at") or 0)
                 weekday = datetime.datetime.now(datetime.timezone.utc).weekday()   # 0=Mon
                 hour    = datetime.datetime.now(datetime.timezone.utc).hour
                 if (now - last_digest) >= 7 * 86400 and weekday == 0 and hour == 9:
                     await _send_weekly_digest(user, tg, db_cfg, now)
+
+                # ── Token expiry warning — alert once when < 48h remaining ───
+                token_exp = int(user.get("token_expires") or 0)
+                if token_exp and 0 < (token_exp - now) < 48 * 3600:
+                    # Use token_exp value as dedup key — resets automatically when token renews
+                    warned_for = int(user.get("token_expiry_warned") or 0)
+                    if warned_for != token_exp:
+                        hours_left = max(1, int((token_exp - now) // 3600))
+                        await tg.send(chat_id,
+                            f"⚠️ <b>HF Radar</b>: Your HackForums token expires in ~{hours_left}h.\n\n"
+                            "Reconnect now to keep your alerts running.",
+                            reply_markup={"inline_keyboard": [[
+                                {"text": "🔗 Reconnect", "url": build_auth_url(cfg, chat_id)}
+                            ]]}
+                        )
+                        await _db(upsert_user, db_cfg, chat_id, {"token_expiry_warned": token_exp})
+                        log.info(f"Token expiry warning sent: chat_id={chat_id} expires_in={hours_left}h")
+                elif user.get("token_expiry_warned"):
+                    # Token was renewed — clear the flag
+                    await _db(upsert_user, db_cfg, chat_id, {"token_expiry_warned": 0})
 
         except Exception as e:
             log.exception(f"schedule_loop error: {e}")
@@ -460,7 +526,6 @@ async def _send_weekly_digest(user: dict, tg, db_cfg: dict, now: int):
     prev_ago_ts = now - 14 * 86400
 
     def _delta(history: list, cutoff: int):
-        """(current_val, delta_from_cutoff) or (None, None). Needs >= 2 entries."""
         if len(history) < 2:
             return None, None
         current = history[-1]["val"]
@@ -472,7 +537,6 @@ async def _send_weekly_digest(user: dict, tg, db_cfg: dict, now: int):
         return f"{sign}{int(n):,}"
 
     def _wow(hist, w_ts, pw_ts):
-        """Week-over-week comparison string, empty if not enough data."""
         _, d_this = _delta(hist, w_ts)
         _, d_prev = _delta(hist, pw_ts)
         if d_this is None or d_prev is None:
@@ -484,7 +548,6 @@ async def _send_weekly_digest(user: dict, tg, db_cfg: dict, now: int):
 
     lines = [f"📊 <b>HF Radar Weekly Digest — {username}</b>\n"]
 
-    # ── Balance ───────────────────────────────────────────────────────────────
     bal_hist               = list(user.get("balance_history") or [])
     current_bal, delta_bal = _delta(bal_hist, week_ago_ts)
     if current_bal is not None:
@@ -492,7 +555,6 @@ async def _send_weekly_digest(user: dict, tg, db_cfg: dict, now: int):
         wow     = _wow(bal_hist, week_ago_ts, prev_ago_ts)
         lines.append(f"💰 Balance: <b>{bal_str} bytes</b>  {_fmt_delta(delta_bal)} this week{wow}")
 
-        # Biggest single tx this week
         bytes_log = list(user.get("bytes_log") or [])
         week_txs  = [t for t in bytes_log if int(t.get("ts") or 0) >= week_ago_ts]
         if week_txs:
@@ -504,28 +566,24 @@ async def _send_weekly_digest(user: dict, tg, db_cfg: dict, now: int):
             reason_str = f"  <i>{b_reason}</i>" if b_reason else ""
             lines.append(f"   ↳ biggest: <b>{b_amt:,} bytes</b>{from_str}{reason_str}")
 
-    # ── Posts ─────────────────────────────────────────────────────────────────
     pn_hist              = list(user.get("postnum_history") or [])
     current_pn, delta_pn = _delta(pn_hist, week_ago_ts)
     if current_pn is not None and delta_pn is not None:
         wow = _wow(pn_hist, week_ago_ts, prev_ago_ts)
         lines.append(f"✏️ Posts: <b>{int(current_pn):,} total</b>  {_fmt_delta(delta_pn)} this week{wow}")
 
-    # ── Threads ───────────────────────────────────────────────────────────────
     tn_hist              = list(user.get("threadnum_history") or [])
     current_tn, delta_tn = _delta(tn_hist, week_ago_ts)
     if current_tn is not None and delta_tn is not None:
         wow = _wow(tn_hist, week_ago_ts, prev_ago_ts)
         lines.append(f"🧵 Threads: <b>{int(current_tn):,} total</b>  {_fmt_delta(delta_tn)} this week{wow}")
 
-    # ── Popularity ────────────────────────────────────────────────────────────
     rep_hist               = list(user.get("rep_history") or [])
     current_rep, delta_rep = _delta(rep_hist, week_ago_ts)
     if current_rep is not None:
         wow = _wow(rep_hist, week_ago_ts, prev_ago_ts)
         lines.append(f"⭐ Popularity: <b>{int(current_rep):,}</b>  {_fmt_delta(delta_rep)} this week{wow}")
 
-    # ── Warning points ────────────────────────────────────────────────────────
     wp = int(user.get("last_warningpoints") or 0)
     if wp > 0:
         lines.append(f"⚠️ Warning points: <b>{wp}</b>")
@@ -555,8 +613,6 @@ async def check_pending_auths_list(pending: list, tg, cfg, db_cfg):
             continue
 
         user = await _db(get_user, db_cfg, chat_id)
-        # Only skip if user already has a live token — reconnecting users have
-        # welcome_sent=1 but access_token=NULL, so we must let those through.
         if user and user.get("welcome_sent") and user.get("access_token"):
             await _db(remove_pending_auth, db_cfg, chat_id)
             continue
@@ -574,7 +630,6 @@ async def check_pending_auths_list(pending: list, tg, cfg, db_cfg):
                 await asyncio.sleep(3)
 
         if not access_token:
-            # Check if the code is less than 9 minutes old — if so, leave it and retry next cycle
             code_age = int(time.time()) - int(p.get("created_at") or 0)
             if code_age < 540:  # 9 minutes
                 log.warning(f"Token exchange failed for chat_id={chat_id} but code is only {code_age}s old — will retry")
@@ -589,7 +644,8 @@ async def check_pending_auths_list(pending: list, tg, cfg, db_cfg):
             )
             continue
 
-        token_expires = token_expires or int(time.time()) + 7776000
+        # expires_in from HF is relative seconds — convert to absolute timestamp
+        token_expires = int(time.time()) + int(token_expires) if token_expires else int(time.time()) + 7776000
         hf      = HFClient(access_token)
         me_data = await hf.read({"me": {"uid": True, "username": True}})
         username, hf_uid = "", 0
@@ -603,7 +659,7 @@ async def check_pending_auths_list(pending: list, tg, cfg, db_cfg):
             log.warning(f"Could not fetch hf_uid for chat_id={chat_id}")
             continue
 
-        now        = int(time.time())
+        now          = int(time.time())
         is_reconnect = bool(user and user.get("welcome_sent"))
         upsert_data  = {
             "hf_uid":        hf_uid,
@@ -615,7 +671,6 @@ async def check_pending_auths_list(pending: list, tg, cfg, db_cfg):
             "active":        1,
             "paused":        0,
         }
-        # Don't reset join timestamp for reconnecting users
         if not is_reconnect:
             upsert_data["joined_at"] = now
         await _db(upsert_user, db_cfg, chat_id, upsert_data)
@@ -649,6 +704,21 @@ async def post_init(application: Application) -> None:
     log.info("Background loops started.")
 
 
+async def post_shutdown(application: Application) -> None:
+    """Clean up aiohttp sessions and thread pool on exit — prevents hang on Windows."""
+    from hf_client import _close_all_sessions
+    try:
+        await _close_all_sessions()
+        log.info("aiohttp sessions closed.")
+    except Exception as e:
+        log.warning(f"Session close error: {e}")
+    try:
+        _db_executor.shutdown(wait=False, cancel_futures=True)
+        log.info("DB executor shut down.")
+    except Exception as e:
+        log.warning(f"Executor shutdown error: {e}")
+
+
 # ── Test Mode ─────────────────────────────────────────────────────────────────
 
 async def run_test(cfg):
@@ -680,14 +750,12 @@ async def post_init_no_poll(application: Application) -> None:
 
 
 def main():
-    cfg     = load_config()
-    db_cfg  = cfg["database"]
+    cfg    = load_config()
+    db_cfg = cfg["database"]
 
-    from hf_client import configure as _configure_hf
-    _configure_hf(cfg)
+    configure_hf(cfg)
     no_poll = "--no-poll" in sys.argv
 
-    # Optional startup delay — set startup_delay_seconds in config.json (default 0)
     startup_delay = int(cfg.get("startup_delay_seconds") or 0)
     if startup_delay > 0:
         log.info(f"Startup delay: {startup_delay}s")
@@ -701,6 +769,7 @@ def main():
         ApplicationBuilder()
         .token(cfg["telegram_token"])
         .post_init(post_init_no_poll if no_poll else post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -719,11 +788,13 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
 
+    import os as _os
     if no_poll:
-        log.info("HF Radar starting in --no-poll mode (API loops disabled)...")
+        log.info(f"HF Radar starting in --no-poll mode (PID {_os.getpid()})")
     else:
-        log.info("HF Radar starting...")
+        log.info(f"HF Radar starting (PID {_os.getpid()})")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    log.info("HF Radar stopped cleanly.")
 
 
 if __name__ == "__main__":

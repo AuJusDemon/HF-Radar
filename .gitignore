@@ -1,5 +1,13 @@
-# Config — never commit the real one
-config.json
+# Config — never commit
+.env
+
+# Local agent memory — never commit
+agent.md
+
+# Database
+*.db
+*.db-shm
+*.db-wal
 
 # Logs
 *.log
@@ -17,8 +25,7 @@ build/
 .eggs/
 *.egg
 
-# Env
-.env
+# Env / venv
 .venv
 venv/
 env/

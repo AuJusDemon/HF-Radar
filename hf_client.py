@@ -20,6 +20,7 @@ get_rate_limit_remaining(). HF's limit is ~240 calls/hour per token.
 """
 import asyncio
 import logging
+import time
 
 import aiohttp
 
@@ -54,20 +55,38 @@ class AuthExpired(Exception):
 
 
 # ── Rate limit tracking ────────────────────────────────────────────────────────
-_rate_limits: dict[str, int] = {}  # token → remaining calls
+# Format: token → (remaining_calls, timestamp)
+# TTL slightly longer than HF's 1-hour window so a bot rate-limited near the
+# end of a window doesn't stay blocked after the window resets.
+_rate_limits: dict[str, tuple[int, float]] = {}
+_RATE_LIMIT_TTL = 65 * 60  # 65 minutes
 
 
 def is_rate_limited(token: str) -> bool:
-    """True if token has < 20 calls remaining."""
-    return _rate_limits.get(token, 9999) < 20
+    """True if token has < 20 calls remaining AND the entry is still fresh."""
+    entry = _rate_limits.get(token)
+    if not entry:
+        return False
+    remaining, ts = entry
+    if time.time() - ts > _RATE_LIMIT_TTL:
+        _rate_limits.pop(token, None)
+        return False
+    return remaining < 20
 
 
 def get_rate_limit_remaining(token: str) -> int:
-    return _rate_limits.get(token, 9999)
+    entry = _rate_limits.get(token)
+    if not entry:
+        return 9999
+    remaining, ts = entry
+    if time.time() - ts > _RATE_LIMIT_TTL:
+        _rate_limits.pop(token, None)
+        return 9999
+    return remaining
 
 
 def _update_rate_limit(token: str, remaining: int) -> None:
-    _rate_limits[token] = remaining
+    _rate_limits[token] = (remaining, time.time())
 
 
 # ── Shared aiohttp session ─────────────────────────────────────────────────────
@@ -79,6 +98,17 @@ def _get_session() -> aiohttp.ClientSession:
     if loop_id not in _sessions or _sessions[loop_id].closed:
         _sessions[loop_id] = aiohttp.ClientSession()
     return _sessions[loop_id]
+
+
+async def _close_all_sessions() -> None:
+    """Close all open aiohttp sessions — call from post_shutdown."""
+    for session in list(_sessions.values()):
+        if not session.closed:
+            try:
+                await session.close()
+            except Exception:
+                pass
+    _sessions.clear()
 
 
 # ── Core request helper ────────────────────────────────────────────────────────

@@ -4,11 +4,11 @@ Telegram bot that monitors your [HackForums](https://hackforums.net) account and
 
 - Thread replies and mentions/quotes
 - New contracts, status changes, and expiry warnings
-- Incoming bytes
+- Incoming bytes transactions
 - New private messages (count)
 - B-ratings on contracts
 - Contract disputes
-- Buddy ban/exile status
+- Buddy ban/exile status changes
 - New threads in watched forums
 - Warning points, account ban/exile
 
@@ -20,7 +20,7 @@ HF Radar polls the HackForums API v2 using your OAuth token. Every cycle it make
 a small number of batched API calls and fires Telegram messages for anything new.
 
 **Medium loop (~2 min):** Account events — PMs, bytes, contracts, rep, warning points.  
-**Slow loop (~15–30 min):** Reply detection, b-ratings, disputes, buddy status, forum threads.
+**Slow loop (~3 min):** Reply detection, b-ratings, disputes, buddy status, forum threads.
 
 The polling logic and every API call made is documented in [`detectors.py`](detectors.py)
 and [`PRIVACY.md`](PRIVACY.md). Nothing is hidden.
@@ -41,7 +41,7 @@ and [`PRIVACY.md`](PRIVACY.md). Nothing is hidden.
 ### 1. Register a HackForums API app
 
 Go to your HF account settings → API → create an application.  
-Set the redirect URI to wherever your callback lands (or use the Telegram state flow — see `commands.py`).  
+Set the redirect URI to any URL — HF Radar uses the `state` parameter flow, so the exact redirect doesn't matter as long as it matches what you registered.  
 You'll get a `client_id` and `client_secret`.
 
 ### 2. Clone and install
@@ -52,110 +52,112 @@ cd hf-radar
 pip install -r requirements.txt
 ```
 
-### 3. Configure
+### 3. Configure via .env
 
 ```bash
-cp config.example.json config.json
+cp .env.example .env
 ```
 
-Edit `config.json`:
+Edit `.env` with your values:
 
-```json
-{
-  "telegram_token": "your-telegram-bot-token",
-  "hf_client_id": "hf_clientid_...",
-  "hf_client_secret": "hf_secret_...",
-  "hf_proxy_url": "socks5://user:pass@your-residential-proxy:port",
-  "database": {
-    "db_path": "hfradar.db"
-  }
-}
+```env
+TELEGRAM_TOKEN=your-bot-token
+HF_CLIENT_ID=hf_clientid_...
+HF_CLIENT_SECRET=hf_secret_...
+HF_PROXY_URL=socks5://user:pass@your-residential-proxy:port
+DB_PATH=hfradar.db
 ```
 
-`config.json` is in `.gitignore`. Never commit it.
+`.env` is in `.gitignore` — never commit it.
 
-### 4. Add `configure()` call to bot.py
+> **Legacy format:** `config.json` is still supported. Copy `config.example.json` → `config.json` if you prefer JSON. `.env` takes priority when `TELEGRAM_TOKEN` is set.
 
-In `bot.py`, add this near the top of `main()` after `cfg = load_config()`:
-
-```python
-from hf_client import configure as configure_hf
-configure_hf(cfg)
-```
-
-This wires the proxy/relay settings into the transport layer.
-
-### 5. Database
-
-No setup needed. SQLite creates `hfradar.db` in the working directory on first run.
-To use a different path, set `"db_path"` in `config.json > "database"`.
-
-### 6. Run
+### 4. Run
 
 ```bash
 python bot.py
 ```
 
-Test mode (sends sample alerts to `test_chat_id`, no polling):
+The bot creates `hfradar.db` on first run and sets up all tables automatically.
 
-```bash
-python bot.py --test
-```
-
-No-poll mode (UI/commands only, loops disabled):
+**Debug mode** (auth flow only, no polling loops):
 
 ```bash
 python bot.py --no-poll
 ```
 
----
+**Test mode** (sends sample alerts to `TEST_CHAT_ID`):
 
-## Transport options
-
-### Direct (recommended for self-hosters)
-
-Set `hf_proxy_url` in config. The bot calls the HF API directly through your residential proxy.
-
-### Relay
-
-If you want to run a relay to handle proxy rotation centrally (e.g. multiple bots sharing one proxy pool), set `vps_relay` and `proxy_secret` in config. The relay must implement `POST /read`, `POST /write`, `POST /token` and forward `X-Rate-Limit-Remaining` in responses.
+```bash
+python bot.py --test
+```
 
 ---
 
-## File overview
+## Running as a service (Linux)
 
-| File | What it does |
-|---|---|
-| `bot.py` | Entry point, PTB setup, polling loops |
-| `detectors.py` | All HF API polling logic — every alert is fired from here |
-| `commands.py` | Telegram command handlers and callback routing |
-| `telegram_bot.py` | TelegramBot shim, keyboard builders, UI text |
-| `alerts.py` | Alert message formatting |
-| `hf_client.py` | HF API transport — handles auth, rate limiting, retries |
-| `db.py` | SQLite schema + all DB operations |
+Create `/etc/systemd/system/hfradar.service`:
+
+```ini
+[Unit]
+Description=HF Radar Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/path/to/hf-radar
+ExecStart=/usr/bin/python3 bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now hfradar
+sudo journalctl -u hfradar -f
+```
 
 ---
 
-## API call budget
+## Proxy notes
 
-Per user per hour with the default polling schedule:
+HackForums is behind Cloudflare, which blocks traffic from datacenters and VPS providers.
+**You must use a residential proxy.** Any provider that offers residential SOCKS5 or HTTP
+proxies will work — set `HF_PROXY_URL` in your `.env`.
 
-- ~66 API calls/hour at steady state (active user with threads to poll)
-- HF's rate limit is ~240 calls/hour per token
-- Hot/cold thread split: active threads polled every cycle, stale threads every 30 min
+If you're running multiple bot instances or want to centralize proxy management, you can
+run a relay server instead — set `VPS_RELAY` and `PROXY_SECRET` and leave `HF_PROXY_URL` empty.
 
-See the budget breakdown comment at the top of `detectors.py` for full detail.
+---
+
+## Configuration reference
+
+| Variable | Required | Description |
+|---|---|---|
+| `TELEGRAM_TOKEN` | ✅ | Bot token from @BotFather |
+| `HF_CLIENT_ID` | ✅ | HackForums OAuth client ID |
+| `HF_CLIENT_SECRET` | ✅ | HackForums OAuth client secret |
+| `HF_PROXY_URL` | ✅* | Residential proxy URL (`socks5://` or `http://`) |
+| `VPS_RELAY` | ✅* | Relay server URL (alternative to direct proxy) |
+| `PROXY_SECRET` | if relay | Shared secret for relay auth |
+| `DB_PATH` | ❌ | SQLite file path (default: `hfradar.db`) |
+| `TEST_CHAT_ID` | ❌ | Chat ID for `--test` mode |
+| `STARTUP_DELAY_SECONDS` | ❌ | Delay startup N seconds (default: 0) |
+
+*Either `HF_PROXY_URL` or `VPS_RELAY` is required — not both.
 
 ---
 
 ## Privacy
 
-See [PRIVACY.md](PRIVACY.md) for a complete breakdown of what is polled and what is stored.
-
-**Short version:** HF Radar reads your account data to send you alerts. It never writes anything, never reads PM content, and never stores post message text. All polling logic is in `detectors.py` — readable, auditable, no surprises.
+See [PRIVACY.md](PRIVACY.md) for exactly what data the bot stores and why.
 
 ---
 
 ## License
 
-MIT
+[MIT](LICENSE)
