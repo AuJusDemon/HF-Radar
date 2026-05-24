@@ -70,8 +70,6 @@ DB_PATH=hfradar.db
 
 `.env` is in `.gitignore` — never commit it.
 
-> **Legacy format:** `config.json` is still supported. Copy `config.example.json` → `config.json` if you prefer JSON. `.env` takes priority when `TELEGRAM_TOKEN` is set.
-
 ### 4. Run
 
 ```bash
@@ -129,9 +127,6 @@ HackForums is behind Cloudflare, which blocks traffic from datacenters and VPS p
 **You must use a residential proxy.** Any provider that offers residential SOCKS5 or HTTP
 proxies will work — set `HF_PROXY_URL` in your `.env`.
 
-If you're running multiple bot instances or want to centralize proxy management, you can
-run a relay server instead — set `VPS_RELAY` and `PROXY_SECRET` and leave `HF_PROXY_URL` empty.
-
 ---
 
 ## Configuration reference
@@ -141,14 +136,10 @@ run a relay server instead — set `VPS_RELAY` and `PROXY_SECRET` and leave `HF_
 | `TELEGRAM_TOKEN` | ✅ | Bot token from @BotFather |
 | `HF_CLIENT_ID` | ✅ | HackForums OAuth client ID |
 | `HF_CLIENT_SECRET` | ✅ | HackForums OAuth client secret |
-| `HF_PROXY_URL` | ✅* | Residential proxy URL (`socks5://` or `http://`) |
-| `VPS_RELAY` | ✅* | Relay server URL (alternative to direct proxy) |
-| `PROXY_SECRET` | if relay | Shared secret for relay auth |
+| `HF_PROXY_URL` | ✅ | Residential proxy URL (`socks5://` or `http://`) |
 | `DB_PATH` | ❌ | SQLite file path (default: `hfradar.db`) |
 | `TEST_CHAT_ID` | ❌ | Chat ID for `--test` mode |
 | `STARTUP_DELAY_SECONDS` | ❌ | Delay startup N seconds (default: 0) |
-
-*Either `HF_PROXY_URL` or `VPS_RELAY` is required — not both.
 
 ---
 
