@@ -136,7 +136,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg, cfg, db_cfg = _get(context)
     from commands import _state as _cst
     _cst.pop(update.effective_chat.id, None)
-    await handle_start(update.effective_chat.id, tg, cfg, db_cfg)
+    start_param = context.args[0] if context.args else ""
+    await handle_start(update.effective_chat.id, tg, cfg, db_cfg, start_param=start_param)
 
 async def cmd_radar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg, cfg, db_cfg = _get(context)
@@ -314,6 +315,65 @@ async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
             uid = int(b.get("uid") or 0)
             if uid:
                 record_buddy_failure(uid)
+
+
+# ── Toolbox Delivery Loop ─────────────────────────────────────────────────────
+
+async def toolbox_delivery_loop(tg, cfg, db_cfg):
+    """
+    Every 30s: read undelivered alert_events from the Toolbox DB, send via Telegram,
+    mark as delivered. Only runs when TOOLBOX_DB_HOST is configured.
+    """
+    try:
+        import toolbox_bridge as _tb
+        if not _tb.ENABLED:
+            log.info("Toolbox delivery loop: TOOLBOX_DB_* not set — skipping")
+            return
+    except Exception as e:
+        log.warning("Toolbox delivery loop: bridge import failed: %s", e)
+        return
+
+    loop = asyncio.get_event_loop()
+    log.info("Toolbox delivery loop started")
+
+    while True:
+        try:
+            events = await loop.run_in_executor(None, _tb.get_all_undelivered_events, 100)
+            for ev in events:
+                chat_id  = ev.get("chat_id")
+                event_id = ev.get("id")
+                ev_type  = ev.get("type", "")
+                title    = ev.get("title", "")
+                body     = ev.get("body", "")
+                link     = ev.get("link", "")
+                if not chat_id or not event_id:
+                    continue
+                try:
+                    msg = _format_toolbox_event(ev_type, title, body, link)
+                    await tg.send(int(chat_id), msg)
+                    await loop.run_in_executor(None, _tb.mark_event_delivered, event_id)
+                except Exception as send_err:
+                    log.warning("Toolbox delivery: send failed event_id=%s chat_id=%s: %s",
+                                event_id, chat_id, send_err)
+        except Exception as e:
+            log.warning("Toolbox delivery loop error: %s", e)
+        await asyncio.sleep(30)
+
+
+def _format_toolbox_event(ev_type: str, title: str, body: str, link: str) -> str:
+    """Format a Toolbox alert event into a Telegram HTML message."""
+    ICONS = {
+        "contract_new":          "📝",
+        "pm_unread_increase":    "📨",
+        "reply_tracked_thread":  "💬",
+    }
+    icon = ICONS.get(ev_type, "🔔")
+    parts = [f"{icon} <b>{title}</b>"] if title else [f"{icon} {ev_type}"]
+    if body:
+        parts.append(body)
+    if link:
+        parts.append(f"🔗 {link.replace('https://', '').replace('http://', '')}")
+    return "\n".join(parts)
 
 
 # ── Background Loops ──────────────────────────────────────────────────────────
@@ -678,6 +738,25 @@ async def check_pending_auths_list(pending: list, tg, cfg, db_cfg):
         await _db(remove_pending_auth, db_cfg, chat_id)
         user = await _db(get_user, db_cfg, chat_id)
 
+        # ── Toolbox detection ─────────────────────────────────────────────────
+        _tb_linked = False
+        try:
+            import toolbox_bridge as _tb
+            if _tb.ENABLED:
+                _tb_mode = await asyncio.get_event_loop().run_in_executor(
+                    None, _tb.get_integration_mode, str(hf_uid)
+                )
+                if _tb_mode in ("toolbox_linked_relay", "both_linked"):
+                    _tb_linked = True
+                elif await asyncio.get_event_loop().run_in_executor(None, _tb.toolbox_user_exists, str(hf_uid)):
+                    await tg.send(chat_id,
+                        "👋 <b>Heads up:</b> your HackForums account is also on HFToolbox.\n\n"
+                        "You can link them for a single Telegram feed — go to "
+                        "<b>HFToolbox Settings → Telegram</b> and tap Connect, then open the link here."
+                    )
+        except Exception as _tbe:
+            log.debug("Toolbox detection failed for chat_id=%s: %s", chat_id, _tbe)
+
         if is_reconnect:
             await tg.send(chat_id, f"✅ reconnected as <b>{username}</b> — you're back online.")
             log.info(f"Reconnected user: chat_id={chat_id} hf_uid={hf_uid} username={username}")
@@ -687,7 +766,8 @@ async def check_pending_auths_list(pending: list, tg, cfg, db_cfg):
                 f"everything is on by default. check the descriptions in the menu so you know what each thing actually tracks."
             )
             log.info(f"New user: chat_id={chat_id} hf_uid={hf_uid} username={username}")
-        await tg.send(chat_id, radar_text(user), reply_markup=radar_keyboard(user, cfg))
+        if not _tb_linked:
+            await tg.send(chat_id, radar_text(user), reply_markup=radar_keyboard(user, cfg))
 
 
 # ── post_init: start loops AFTER app is running ────────────────────────────────
@@ -697,10 +777,11 @@ async def post_init(application: Application) -> None:
     cfg    = application.bot_data["cfg"]
     db_cfg = application.bot_data["db_cfg"]
 
-    application.create_task(_restartable("auth_loop",      auth_loop,      tg, cfg, db_cfg))
-    application.create_task(_restartable("medium_loop",    medium_loop,    tg, cfg, db_cfg))
-    application.create_task(_restartable("slow_loop",      slow_loop,      tg, cfg, db_cfg))
-    application.create_task(_restartable("schedule_loop",  schedule_loop,  tg, cfg, db_cfg))
+    application.create_task(_restartable("auth_loop",             auth_loop,             tg, cfg, db_cfg))
+    application.create_task(_restartable("medium_loop",           medium_loop,           tg, cfg, db_cfg))
+    application.create_task(_restartable("slow_loop",             slow_loop,             tg, cfg, db_cfg))
+    application.create_task(_restartable("schedule_loop",         schedule_loop,         tg, cfg, db_cfg))
+    application.create_task(_restartable("toolbox_delivery_loop", toolbox_delivery_loop, tg, cfg, db_cfg))
     log.info("Background loops started.")
 
 
