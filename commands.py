@@ -45,46 +45,6 @@ def build_auth_url(cfg: dict, chat_id: int) -> str:
 async def handle_start(chat_id: int, tg: TelegramBot, cfg: dict, db_cfg: dict, start_param: str = ""):
     _clear(chat_id)
 
-    # ── tb_<code> deep link — Toolbox linking flow ─────────────────────────
-    if start_param and start_param.startswith("tb_"):
-        code = start_param[3:]
-        try:
-            import toolbox_bridge as _tb
-            if not _tb.ENABLED:
-                await tg.send(chat_id, "Toolbox integration is not configured on this Radar instance.")
-                return
-            hf_uid = await asyncio.get_running_loop().run_in_executor(None, _tb.consume_link_code, code)
-            if not hf_uid:
-                await tg.send(chat_id,
-                    "That link has expired or already been used.\n"
-                    "Generate a new one from your HFToolbox Settings → Telegram."
-                )
-                return
-            # Link this chat_id to the Toolbox HF account
-            await asyncio.get_running_loop().run_in_executor(
-                None, _tb.create_toolbox_telegram_link, hf_uid, chat_id
-            )
-            # Create a Radar user record so /radar recognises this user without HF OAuth
-            try:
-                hf_uid_int = int(hf_uid)
-            except (ValueError, TypeError):
-                hf_uid_int = 0
-            await asyncio.get_running_loop().run_in_executor(
-                None, upsert_user, db_cfg, chat_id,
-                {"hf_uid": hf_uid_int, "active": 1, "welcome_sent": 1, "toolbox_mode": 1}
-            )
-            await tg.send(chat_id,
-                "✅ <b>Toolbox linked!</b>\n\n"
-                "Your HFToolbox account is now connected. You'll receive Telegram alerts "
-                "for contracts, PMs, replies, and more — delivered here as they happen.\n\n"
-                "No HF Radar auth needed. You're all set."
-            )
-            log.info("Toolbox linked: chat_id=%s hf_uid=%s", chat_id, hf_uid)
-        except Exception as e:
-            log.error("Toolbox link error: chat_id=%s code=%s: %s", chat_id, code, e)
-            await tg.send(chat_id, "Something went wrong linking your account. Try again from HFToolbox Settings.")
-        return
-
     user = get_user(db_cfg, chat_id)
 
     if user:

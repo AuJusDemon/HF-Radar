@@ -19,6 +19,7 @@ Rate limit tracking: tracked per-token, exposed via is_rate_limited() /
 get_rate_limit_remaining(). HF's limit is ~240 calls/hour per token.
 """
 import asyncio
+import json
 import logging
 import time
 
@@ -26,7 +27,14 @@ import aiohttp
 
 log = logging.getLogger("hfradar.api")
 
-HF_API_BASE  = "https://hackforums.net/api/v2"
+HF_API_BASE = "https://hackforums.net/api/v2"
+HF_AUTH = f"{HF_API_BASE}/authorize"
+
+HF_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # ── Runtime configuration ──────────────────────────────────────────────────────
 # Call configure() from bot.py at startup before any HFClient is created.
@@ -50,8 +58,17 @@ def configure(cfg: dict):
 # ── Auth error ─────────────────────────────────────────────────────────────────
 
 class AuthExpired(Exception):
-    """Raised when HF returns 401 — token is dead."""
+    """Raised when HF rejects a disabled, revoked, or expired token."""
     pass
+
+
+_AUTH_FAILURE_MESSAGES = frozenset({
+    "TOKEN_DISABLED",
+    "TOKEN_EXPIRED",
+    "TOKEN_INVALID",
+    "TOKEN_REVOKED",
+    "INVALID_TOKEN",
+})
 
 
 # ── Rate limit tracking ────────────────────────────────────────────────────────
@@ -129,21 +146,28 @@ async def _request(token: str, route: str, body: dict, retry: bool = True) -> di
     else:
         # Direct mode — call HF API with residential proxy
         url     = f"{HF_API_BASE}/{route}"
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = {**HF_HEADERS, "Authorization": f"Bearer {token}"}
         proxy   = _HF_PROXY_URL or None
 
     timeout = aiohttp.ClientTimeout(total=30)
 
     try:
         session = _get_session()
-        async with session.post(url, json=body, headers=headers,
+        request_kwargs = {"json": body} if _VPS_RELAY else {"data": {"asks": json.dumps(body)}}
+        async with session.post(url, headers=headers, **request_kwargs,
                                 timeout=timeout, proxy=proxy) as resp:
             rl = resp.headers.get("X-Rate-Limit-Remaining")
             if rl and rl.isdigit():
                 _update_rate_limit(token, int(rl))
 
             if resp.status == 200:
-                return await resp.json()
+                data = await resp.json()
+                if isinstance(data, dict):
+                    message = str(data.get("message") or "").upper()
+                    if message in _AUTH_FAILURE_MESSAGES:
+                        log.warning("HF rejected access token: %s", message)
+                        raise AuthExpired()
+                return data
             if resp.status == 401:
                 raise AuthExpired()
             if resp.status == 403:
@@ -222,15 +246,16 @@ async def exchange_code_for_token(code: str, cfg: dict):
                 log.error(f"Token exchange failed via relay: HTTP {resp.status}")
                 return None, None, None
         else:
-            # Direct to HF token endpoint
+            # HF exchanges OAuth codes through POST /authorize.
             async with session.post(
-                f"{HF_API_BASE}/token",
+                HF_AUTH,
                 data={
                     "grant_type":    "authorization_code",
                     "code":          code,
                     "client_id":     cfg["hf_client_id"],
                     "client_secret": cfg.get("hf_client_secret") or cfg.get("hf_secret"),
                 },
+                headers=HF_HEADERS,
                 proxy=_HF_PROXY_URL or None,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:

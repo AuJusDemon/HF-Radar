@@ -49,6 +49,8 @@ logging.basicConfig(
         logging.FileHandler("hfradar.log", encoding="utf-8"),
     ]
 )
+# httpx logs Telegram API URLs, which include the bot token in the path.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("hfradar")
 
 # DB thread pool — dedicated, never shares with HF or Telegram
@@ -322,65 +324,6 @@ async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
                 record_buddy_failure(uid)
 
 
-# ── Toolbox Delivery Loop ─────────────────────────────────────────────────────
-
-async def toolbox_delivery_loop(tg, cfg, db_cfg):
-    """
-    Every 30s: read undelivered alert_events from the Toolbox DB, send via Telegram,
-    mark as delivered. Only runs when TOOLBOX_DB_HOST is configured.
-    """
-    try:
-        import toolbox_bridge as _tb
-        if not _tb.ENABLED:
-            log.info("Toolbox delivery loop: TOOLBOX_DB_* not set — skipping")
-            return
-    except Exception as e:
-        log.warning("Toolbox delivery loop: bridge import failed: %s", e)
-        return
-
-    loop = asyncio.get_event_loop()
-    log.info("Toolbox delivery loop started")
-
-    while True:
-        try:
-            events = await loop.run_in_executor(None, _tb.get_all_undelivered_events, 100)
-            for ev in events:
-                chat_id  = ev.get("chat_id")
-                event_id = ev.get("id")
-                ev_type  = ev.get("type", "")
-                title    = ev.get("title", "")
-                body     = ev.get("body", "")
-                link     = ev.get("link", "")
-                if not chat_id or not event_id:
-                    continue
-                try:
-                    msg = _format_toolbox_event(ev_type, title, body, link)
-                    await tg.send(int(chat_id), msg)
-                    await loop.run_in_executor(None, _tb.mark_event_delivered, event_id)
-                except Exception as send_err:
-                    log.warning("Toolbox delivery: send failed event_id=%s chat_id=%s: %s",
-                                event_id, chat_id, send_err)
-        except Exception as e:
-            log.warning("Toolbox delivery loop error: %s", e)
-        await asyncio.sleep(30)
-
-
-def _format_toolbox_event(ev_type: str, title: str, body: str, link: str) -> str:
-    """Format a Toolbox alert event into a Telegram HTML message."""
-    ICONS = {
-        "contract_new":          "📝",
-        "pm_unread_increase":    "📨",
-        "reply_tracked_thread":  "💬",
-    }
-    icon = ICONS.get(ev_type, "🔔")
-    parts = [f"{icon} <b>{title}</b>"] if title else [f"{icon} {ev_type}"]
-    if body:
-        parts.append(body)
-    if link:
-        parts.append(f"🔗 {link.replace('https://', '').replace('http://', '')}")
-    return "\n".join(parts)
-
-
 # ── Background Loops ──────────────────────────────────────────────────────────
 
 async def auth_loop(tg, cfg, db_cfg):
@@ -426,26 +369,6 @@ async def medium_loop(tg, cfg, db_cfg):
         try:
             users  = await _db(get_all_active_users, db_cfg) or []
             active = [u for u in users if not u.get("paused") and u.get("access_token")]
-
-            # Include both_linked users using their Toolbox token
-            try:
-                import toolbox_bridge as _tb
-                if _tb.ENABLED:
-                    loop = asyncio.get_event_loop()
-                    for u in users:
-                        if u.get("paused") or u.get("access_token") or not u.get("toolbox_mode"):
-                            continue
-                        hf_uid = u.get("hf_uid")
-                        if not hf_uid:
-                            continue
-                        mode = await loop.run_in_executor(None, _tb.get_integration_mode, str(hf_uid))
-                        if mode != "both_linked":
-                            continue
-                        token = await loop.run_in_executor(None, _tb.get_user_access_token, str(hf_uid))
-                        if token:
-                            active.append({**u, "access_token": token})
-            except Exception as _tbe:
-                log.debug("medium_loop: bridge user injection failed: %s", _tbe)
 
             if active:
                 jitter_step = min(INTERVAL / max(len(active), 1), 15)
@@ -499,26 +422,6 @@ async def slow_loop(tg, cfg, db_cfg):
         try:
             users  = await _db(get_all_active_users, db_cfg) or []
             active = [u for u in users if not u.get("paused") and u.get("access_token")]
-
-            # Include both_linked users using their Toolbox token
-            try:
-                import toolbox_bridge as _tb
-                if _tb.ENABLED:
-                    loop = asyncio.get_event_loop()
-                    for u in users:
-                        if u.get("paused") or u.get("access_token") or not u.get("toolbox_mode"):
-                            continue
-                        hf_uid = u.get("hf_uid")
-                        if not hf_uid:
-                            continue
-                        mode = await loop.run_in_executor(None, _tb.get_integration_mode, str(hf_uid))
-                        if mode != "both_linked":
-                            continue
-                        token = await loop.run_in_executor(None, _tb.get_user_access_token, str(hf_uid))
-                        if token:
-                            active.append({**u, "access_token": token})
-            except Exception as _tbe:
-                log.debug("slow_loop: bridge user injection failed: %s", _tbe)
 
             if active:
                 jitter_step = min(INTERVAL / max(len(active), 1), 20)
@@ -786,35 +689,28 @@ async def check_pending_auths_list(pending: list, tg, cfg, db_cfg):
         user = await _db(get_user, db_cfg, chat_id)
 
         # ── Toolbox detection ─────────────────────────────────────────────────
-        _tb_linked = False
         try:
             import toolbox_bridge as _tb
             if _tb.ENABLED:
-                _tb_mode = await asyncio.get_event_loop().run_in_executor(
-                    None, _tb.get_integration_mode, str(hf_uid)
-                )
-                if _tb_mode in ("toolbox_linked_relay", "both_linked"):
-                    _tb_linked = True
-                elif await asyncio.get_event_loop().run_in_executor(None, _tb.toolbox_user_exists, str(hf_uid)):
+                if await asyncio.get_event_loop().run_in_executor(None, _tb.toolbox_user_exists, str(hf_uid)):
                     await tg.send(chat_id,
                         "👋 <b>Heads up:</b> your HackForums account is also on HFToolbox.\n\n"
-                        "You can link them for a single Telegram feed — go to "
+                        "You can link them for Telegram alerts — go to "
                         "<b>HFToolbox Settings → Telegram</b> and tap Connect, then open the link here."
                     )
         except Exception as _tbe:
             log.debug("Toolbox detection failed for chat_id=%s: %s", chat_id, _tbe)
 
         if is_reconnect:
-            await tg.send(chat_id, f"✅ reconnected as <b>{username}</b> — you're back online.")
+            await tg.send(chat_id, f"✅ Reconnected as <b>{username}</b>. Your Radar controls are below.")
             log.info(f"Reconnected user: chat_id={chat_id} hf_uid={hf_uid} username={username}")
         else:
             await tg.send(chat_id,
-                f"you're in, {username or f'UID {hf_uid}'}\n\n"
-                f"everything is on by default. check the descriptions in the menu so you know what each thing actually tracks."
+                f"✅ <b>Welcome to HF Radar, {username or f'UID {hf_uid}'}!</b>\n\n"
+                "Alerts are enabled by default. Use the menu below to choose what Radar tracks."
             )
             log.info(f"New user: chat_id={chat_id} hf_uid={hf_uid} username={username}")
-        if not _tb_linked:
-            await tg.send(chat_id, radar_text(user), reply_markup=radar_keyboard(user, cfg))
+        await tg.send(chat_id, radar_text(user), reply_markup=radar_keyboard(user, cfg))
 
 
 # ── post_init: start loops AFTER app is running ────────────────────────────────
@@ -826,9 +722,8 @@ async def post_init(application: Application) -> None:
 
     application.create_task(_restartable("auth_loop",             auth_loop,             tg, cfg, db_cfg))
     application.create_task(_restartable("medium_loop",           medium_loop,           tg, cfg, db_cfg))
-    application.create_task(_restartable("slow_loop",             slow_loop,             tg, cfg, db_cfg))
-    application.create_task(_restartable("schedule_loop",         schedule_loop,         tg, cfg, db_cfg))
-    application.create_task(_restartable("toolbox_delivery_loop", toolbox_delivery_loop, tg, cfg, db_cfg))
+    application.create_task(_restartable("slow_loop",     slow_loop,     tg, cfg, db_cfg))
+    application.create_task(_restartable("schedule_loop", schedule_loop, tg, cfg, db_cfg))
     log.info("Background loops started.")
 
 

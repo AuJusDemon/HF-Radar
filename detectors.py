@@ -1151,8 +1151,7 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
     # These run less frequently (warm=15min, cold=30min) so per-thread posts fetches
     # on activity are fine — low call rate. Also handles bestpid/views/closed detection
     # for all tiers (hot threads inherit those checks here on their warm cycle).
-    threads  = []
-    bad_tids = set()
+    threads = []
 
     async def poll_chunk(chunk):
         if not chunk:
@@ -1181,26 +1180,19 @@ async def check_posts(user: dict, hf: HFClient, tg: TelegramBot, cfg: dict, db_c
             if isinstance(rows, dict): rows = [rows]
             return rows
         if state_data is None:
-            # None = network error, timeout, or rate limit — NOT a missing thread
-            # Do not bisect or prune, just skip this chunk silently
+            # Network error, timeout, or rate limit is not proof a thread disappeared.
             return []
-        if len(chunk) == 1:
-            # Got a real API response but thread wasn't in it — actually inaccessible
-            log.info(f"Removing inaccessible tid={chunk[0]} from known_tids")
-            bad_tids.add(chunk[0])
-            return []
-        # Bisect — split and retry each half
-        mid = len(chunk) // 2
-        return (await poll_chunk(chunk[:mid])) + (await poll_chunk(chunk[mid:]))
+        # HF can return an API-level failure payload with HTTP 200. Missing thread
+        # data is not enough evidence to mutate the user's tracking list.
+        log.warning(
+            "check_posts: threads response missing data for %d tids; retaining known_tids",
+            len(chunk),
+        )
+        return []
 
     for i in range(0, len(tids_to_poll), 30):
         chunk = tids_to_poll[i:i+30]
         threads.extend(await poll_chunk(chunk))
-
-    if bad_tids:
-        known_tids = [t for t in known_tids if t not in bad_tids]
-        await _db(upsert_user, db_cfg, chat_id, {"known_tids": known_tids})
-        log.info(f"Pruned {len(bad_tids)} inaccessible tids from known_tids")
 
     for t in (threads or []):
         tid           = str(t.get("tid", ""))
