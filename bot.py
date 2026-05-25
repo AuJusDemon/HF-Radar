@@ -226,15 +226,20 @@ async def _run_slow(user, hf, tg, cfg, db_cfg, other_users=None):
     chat_id = user.get("chat_id")
 
     async def _handle_auth_expired():
-        """Nuke token and notify user on 401."""
         from db import upsert_user as _upsert
         _upsert(db_cfg, chat_id, {"active": 0, "paused": 1, "access_token": None})
-        await tg.send(chat_id,
-            "⚠️ <b>HF Radar : Authorization expired</b>\n\n"
-            "Your HackForums access was revoked or expired.\n"
-            "All your settings have been saved.\n\n"
-            "Use /start to reconnect and pick up where you left off."
-        )
+        if user.get("toolbox_mode"):
+            await tg.send(chat_id,
+                "⚠️ <b>HF Radar</b>: Your HackForums token has expired.\n\n"
+                "Re-authenticate in <b>HFToolbox</b> to restore alerts."
+            )
+        else:
+            await tg.send(chat_id,
+                "⚠️ <b>HF Radar : Authorization expired</b>\n\n"
+                "Your HackForums access was revoked or expired.\n"
+                "All your settings have been saved.\n\n"
+                "Use /start to reconnect and pick up where you left off."
+            )
 
     try:
         await asyncio.wait_for(check_posts(user, hf, tg, cfg, db_cfg, other_users=other_users), timeout=50)
@@ -421,6 +426,27 @@ async def medium_loop(tg, cfg, db_cfg):
         try:
             users  = await _db(get_all_active_users, db_cfg) or []
             active = [u for u in users if not u.get("paused") and u.get("access_token")]
+
+            # Include both_linked users using their Toolbox token
+            try:
+                import toolbox_bridge as _tb
+                if _tb.ENABLED:
+                    loop = asyncio.get_event_loop()
+                    for u in users:
+                        if u.get("paused") or u.get("access_token") or not u.get("toolbox_mode"):
+                            continue
+                        hf_uid = u.get("hf_uid")
+                        if not hf_uid:
+                            continue
+                        mode = await loop.run_in_executor(None, _tb.get_integration_mode, str(hf_uid))
+                        if mode != "both_linked":
+                            continue
+                        token = await loop.run_in_executor(None, _tb.get_user_access_token, str(hf_uid))
+                        if token:
+                            active.append({**u, "access_token": token})
+            except Exception as _tbe:
+                log.debug("medium_loop: bridge user injection failed: %s", _tbe)
+
             if active:
                 jitter_step = min(INTERVAL / max(len(active), 1), 15)
                 tasks = [
@@ -473,6 +499,27 @@ async def slow_loop(tg, cfg, db_cfg):
         try:
             users  = await _db(get_all_active_users, db_cfg) or []
             active = [u for u in users if not u.get("paused") and u.get("access_token")]
+
+            # Include both_linked users using their Toolbox token
+            try:
+                import toolbox_bridge as _tb
+                if _tb.ENABLED:
+                    loop = asyncio.get_event_loop()
+                    for u in users:
+                        if u.get("paused") or u.get("access_token") or not u.get("toolbox_mode"):
+                            continue
+                        hf_uid = u.get("hf_uid")
+                        if not hf_uid:
+                            continue
+                        mode = await loop.run_in_executor(None, _tb.get_integration_mode, str(hf_uid))
+                        if mode != "both_linked":
+                            continue
+                        token = await loop.run_in_executor(None, _tb.get_user_access_token, str(hf_uid))
+                        if token:
+                            active.append({**u, "access_token": token})
+            except Exception as _tbe:
+                log.debug("slow_loop: bridge user injection failed: %s", _tbe)
+
             if active:
                 jitter_step = min(INTERVAL / max(len(active), 1), 20)
                 tasks = [

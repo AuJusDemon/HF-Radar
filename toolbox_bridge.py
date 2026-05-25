@@ -269,8 +269,8 @@ def set_integration_mode(hf_uid: str, mode: str) -> None:
 
 def get_all_undelivered_events(limit: int = 100) -> list[dict]:
     """
-    Return undelivered alert events for all linked users, enriched with chat_id.
-    Joins alert_events with telegram_links so Radar knows where to send each event.
+    Return undelivered alert events for linked users, enriched with chat_id.
+    Excludes both_linked users — their delivery is handled by Radar's native polling loops.
     """
     with _db() as cur:
         cur.execute(
@@ -278,7 +278,9 @@ def get_all_undelivered_events(limit: int = 100) -> list[dict]:
             "       ae.source, ae.payload, ae.created_at, tl.chat_id "
             "FROM alert_events ae "
             "INNER JOIN telegram_links tl ON tl.hf_uid = ae.hf_uid "
+            "LEFT JOIN integration_accounts ia ON ia.hf_uid = ae.hf_uid "
             "WHERE ae.telegram_sent = 0 "
+            "  AND (ia.mode IS NULL OR ia.mode != 'both_linked') "
             "ORDER BY ae.created_at ASC LIMIT %s",
             (limit,)
         )
@@ -295,10 +297,46 @@ def get_all_undelivered_events(limit: int = 100) -> list[dict]:
     return result
 
 
+# ── Token access ─────────────────────────────────────────────────────────────
+
+def get_user_access_token(hf_uid: str) -> str | None:
+    try:
+        with _db() as cur:
+            cur.execute("SELECT token FROM users WHERE uid=%s", (str(hf_uid),))
+            row = cur.fetchone()
+        if not row or not row.get("token"):
+            return None
+        enc = row["token"]
+        if not enc.startswith("e:"):
+            return enc or None  # plaintext (no encryption)
+        import base64
+        from cryptography.fernet import Fernet, InvalidToken
+        ciphertext = enc[2:].encode()
+        key = os.getenv("TOKEN_ENCRYPT_KEY", "").strip()
+        if key:
+            try:
+                return Fernet(key.encode()).decrypt(ciphertext).decode()
+            except (InvalidToken, Exception):
+                pass
+        # SESSION_SECRET fallback (tokens encrypted before TOKEN_ENCRYPT_KEY was set)
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes
+        secret = os.getenv("SESSION_SECRET", "fallback-insecure-key")
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                         salt=b"hftoolbox-token-enc", iterations=100_000)
+        raw = kdf.derive(secret.encode())
+        try:
+            return Fernet(base64.urlsafe_b64encode(raw)).decrypt(ciphertext).decode()
+        except Exception:
+            return None
+    except Exception as e:
+        log.debug("get_user_access_token failed uid=%s: %s", hf_uid, e)
+        return None
+
+
 # ── User check ────────────────────────────────────────────────────────────────
 
 def toolbox_user_exists(hf_uid: str) -> bool:
-    """Check if hf_uid has a Toolbox account (is in integration_accounts table)."""
     try:
         with _db() as cur:
             cur.execute(
