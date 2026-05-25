@@ -64,6 +64,15 @@ async def handle_start(chat_id: int, tg: TelegramBot, cfg: dict, db_cfg: dict, s
             await asyncio.get_running_loop().run_in_executor(
                 None, _tb.create_toolbox_telegram_link, hf_uid, chat_id
             )
+            # Create a Radar user record so /radar recognises this user without HF OAuth
+            try:
+                hf_uid_int = int(hf_uid)
+            except (ValueError, TypeError):
+                hf_uid_int = 0
+            await asyncio.get_running_loop().run_in_executor(
+                None, upsert_user, db_cfg, chat_id,
+                {"hf_uid": hf_uid_int, "active": 1, "welcome_sent": 1, "toolbox_mode": 1}
+            )
             await tg.send(chat_id,
                 "✅ <b>Toolbox linked!</b>\n\n"
                 "Your HFToolbox account is now connected. You'll receive Telegram alerts "
@@ -116,6 +125,14 @@ async def handle_radar(chat_id: int, tg: TelegramBot, cfg: dict, db_cfg: dict):
     user = get_user(db_cfg, chat_id)
     if not user:
         await tg.send(chat_id, "You're not connected yet. Use /start to link your account.")
+        return
+    if user.get("toolbox_mode") and not user.get("access_token"):
+        await tg.send(chat_id,
+            "📡 <b>HF Radar</b>\n\n"
+            "✅ Connected via <b>HFToolbox</b>.\n\n"
+            "Alerts for contracts, PMs, and tracked replies are delivered here automatically. "
+            "Manage which alerts you receive from <b>HFToolbox Settings → Telegram</b>."
+        )
         return
     await tg.send(chat_id, radar_text(user), reply_markup=radar_keyboard(user, cfg))
 

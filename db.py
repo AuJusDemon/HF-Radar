@@ -205,6 +205,7 @@ def _mysql_init(cfg: dict):
             ("thread_state",                "TEXT DEFAULT '{}'"),
             ("last_dispute_check_at",       "INT DEFAULT 0"),
             ("last_discovery_threadnum",    "INT DEFAULT 0"),
+            ("toolbox_mode",                "TINYINT DEFAULT 0"),
         ]:
             _mysql_add_col(cur, "users", col, defn)
         try:
@@ -374,6 +375,7 @@ def _sqlite_init(cfg: dict):
             ("gambling_pending",            "TEXT DEFAULT NULL"),
             ("last_gambling_flush",         "INTEGER DEFAULT 0"),
             ("features",                    "TEXT DEFAULT NULL"),
+            ("toolbox_mode",                "INTEGER DEFAULT 0"),
         ]:
             _sqlite_add_col(conn, "users", col, defn)
 
